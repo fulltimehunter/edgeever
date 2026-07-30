@@ -39,6 +39,18 @@ export type MemoDetail = MemoSummary & {
   mergedIntoMemoId: string | null;
 };
 
+export type MemoTemplate = {
+  id: string;
+  name: string;
+  description: string | null;
+  title: string | null;
+  contentJson: TiptapDoc;
+  contentMarkdown: string;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type MemoEditSession = {
   id: string;
   memoId: string;
@@ -132,6 +144,19 @@ export type AuthSession = {
   demoMode: boolean;
   user: AuthUser | null;
   sessionToken?: string;
+};
+
+export type LoginDeviceSession = {
+  id: string;
+  userAgent: string | null;
+  label: string | null;
+  ipAddress: string | null;
+  ipCountry: string | null;
+  ipRegion: string | null;
+  isCurrent: boolean;
+  createdAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
 };
 
 export type ApiError = {

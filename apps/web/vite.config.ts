@@ -2,9 +2,9 @@ import react from "@vitejs/plugin-react";
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath, URL } from "node:url";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
-import { resolveAppVersion } from "./build-metadata";
+import { resolveAppVersion, resolveDeploymentMethod, resolveDeploymentTrigger, resolveReleaseTimestamp } from "./build-metadata";
 
 const readPackageVersion = () => {
   try {
@@ -34,21 +34,90 @@ const readGitDescription = () => {
   }
 };
 
+const readLatestReleaseCommitTimestamp = () => {
+  try {
+    const releaseTag = execSync('git describe --tags --abbrev=0 --match "v[0-9]*.[0-9]*.[0-9]*" HEAD', { encoding: "utf8" }).trim();
+    return execSync(`git log -1 --format=%cI ${releaseTag}`, { encoding: "utf8" }).trim();
+  } catch {
+    // Workers Builds may check out the source without fetching tags. The
+    // package version is updated in the release-preparation commit, so its
+    // timestamp is the best local fallback for self-hosted builds.
+    try {
+      return execSync("git log -1 --format=%cI -- package.json", { encoding: "utf8" }).trim();
+    } catch {
+      return "";
+    }
+  }
+};
+
 const buildId = process.env.WORKERS_CI_COMMIT_SHA?.slice(0, 12)
   ?? process.env.CF_PAGES_COMMIT_SHA?.slice(0, 12)
   ?? process.env.GITHUB_SHA?.slice(0, 12)
   ?? readGitCommit()
   ?? "local";
-const appVersion = resolveAppVersion(readPackageVersion(), readGitDescription());
+const gitDescription = readGitDescription();
+const appVersion = resolveAppVersion(readPackageVersion(), gitDescription);
+const OPTIONAL_CHUNK_WARNING_LIMIT_KB = 1_700;
+const TARGET_VENDOR_CHUNK_BYTES = 450 * 1024;
+const releaseTimestamp = resolveReleaseTimestamp(process.env.EDGE_EVER_RELEASED_AT) || readLatestReleaseCommitTimestamp();
+const deploymentTrigger = resolveDeploymentTrigger(
+  process.env.EDGE_EVER_DEPLOYMENT_TRIGGER
+    ?? (process.env.WORKERS_CI_COMMIT_SHA ? "main_push" : undefined)
+);
+const deploymentMethod = resolveDeploymentMethod(
+  process.env.EDGE_EVER_DEPLOYMENT_METHOD
+    ?? (process.env.WORKERS_CI_COMMIT_SHA
+      ? "cloudflare_workers_builds"
+      : process.env.GITHUB_ACTIONS
+        ? "github_actions"
+        : undefined)
+);
+const isDesktopBuild = process.env.EDGE_EVER_DESKTOP_BUILD === "1";
+const developmentServiceWorkerReset: Plugin = {
+  name: "edgeever-development-service-worker-reset",
+  apply: "serve",
+  configureServer(server) {
+    server.middlewares.use((request, response, next) => {
+      if (request.url?.split("?")[0] !== "/sw.js") {
+        next();
+        return;
+      }
+
+      response.statusCode = 200;
+      response.setHeader("Content-Type", "application/javascript; charset=utf-8");
+      response.setHeader("Cache-Control", "no-store");
+      response.end(`
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => {
+  event.waitUntil((async () => {
+    const cacheNames = await caches.keys();
+    await Promise.all(cacheNames.map((cacheName) => caches.delete(cacheName)));
+    await self.clients.claim();
+    await self.registration.unregister();
+    const clients = await self.clients.matchAll({ type: "window" });
+    await Promise.all(clients.map((client) => client.navigate(client.url)));
+  })());
+});
+`);
+    });
+  },
+};
 
 export default defineConfig({
   root: "apps/web",
+  // Packaged Electron apps load index.html via file://, so root-absolute
+  // asset URLs resolve to the filesystem root and leave a blank window.
+  base: isDesktopBuild ? "./" : "/",
   define: {
     __EDGEEVER_APP_VERSION__: JSON.stringify(appVersion),
     __EDGEEVER_BUILD_ID__: JSON.stringify(buildId),
     __EDGEEVER_BUILD_LABEL__: JSON.stringify(buildId === "local" ? "local" : buildId.slice(0, 7)),
+    __EDGEEVER_RELEASED_AT__: JSON.stringify(releaseTimestamp),
+    __EDGEEVER_DEPLOYMENT_TRIGGER__: JSON.stringify(deploymentTrigger),
+    __EDGEEVER_DEPLOYMENT_METHOD__: JSON.stringify(deploymentMethod),
   },
   plugins: [
+    developmentServiceWorkerReset,
     react(),
     VitePWA({
       registerType: "autoUpdate",
@@ -85,9 +154,64 @@ export default defineConfig({
       },
       workbox: {
         globPatterns: ["**/*.{js,css,html,ico,png,svg,webp,woff2}"],
-        navigateFallback: "/index.html",
-        navigateFallbackDenylist: [/^\/api\//, /^\/mcp\//, /^\/mobile-edit\.html$/, /^\/tiptap-ime-test\.html$/],
+        cleanupOutdatedCaches: true,
+        additionalManifestEntries: [
+          {
+            revision: buildId,
+            url: `/index.html?edgeever-offline-shell=${encodeURIComponent(buildId)}`,
+          },
+        ],
+        globIgnores: [
+          "index.html",
+          "**/*beautiful-mermaid*.js",
+          "**/*mermaid.core-*.js",
+          "**/vendor-mermaid-*.js",
+          "**/*Diagram-*.js",
+        ],
+        navigateFallback: null,
+        navigationPreload: true,
         runtimeCaching: [
+          {
+            urlPattern: ({ request, url }) =>
+              request.mode === "navigate" &&
+              !["/mobile-edit.html", "/note-print.html", "/tiptap-ime-test.html"].includes(url.pathname),
+            handler: "NetworkFirst",
+            options: {
+              cacheName: "edgeever-app-shell",
+              networkTimeoutSeconds: 5,
+              cacheableResponse: {
+                statuses: [0, 200],
+              },
+              precacheFallback: {
+                fallbackURL: `/index.html?edgeever-offline-shell=${encodeURIComponent(buildId)}`,
+              },
+            },
+          },
+          {
+            urlPattern: ({ url }) => /^\/api\/v1\/resources\/[^/]+\/blob$/.test(url.pathname),
+            handler: "CacheFirst",
+            options: {
+              cacheName: "edgeever-resource-blobs",
+              cacheableResponse: {
+                statuses: [0, 200],
+              },
+              expiration: {
+                maxEntries: 500,
+                maxAgeSeconds: 60 * 60 * 24 * 90,
+              },
+            },
+          },
+          {
+            urlPattern: ({ url }) => /\/assets\/(?:.*beautiful-mermaid|vendor-mermaid|.*mermaid\.core|.*Diagram-)/.test(url.pathname),
+            handler: "CacheFirst",
+            options: {
+              cacheName: "edgeever-optional-diagrams",
+              expiration: {
+                maxEntries: 120,
+                maxAgeSeconds: 60 * 60 * 24 * 30,
+              },
+            },
+          },
           {
             urlPattern: ({ url }) => url.pathname.startsWith("/api/") || url.pathname.startsWith("/mcp/"),
             handler: "NetworkOnly",
@@ -116,15 +240,34 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    // ELK is distributed as one ~1.6 MiB module by beautiful-mermaid. It is
+    // loaded only when a diagram is rendered and is excluded from HTML
+    // modulepreload and PWA precache; verify-web-performance.mjs enforces
+    // those constraints for every chunk above Vite's default 500 KiB limit.
+    chunkSizeWarningLimit: OPTIONAL_CHUNK_WARNING_LIMIT_KB,
+    modulePreload: isDesktopBuild
+      ? false
+      : {
+          resolveDependencies: (_filename, dependencies) => dependencies.filter((dependency) =>
+            !/(?:vendor-code-highlight|vendor-(?:mermaid|D3|tiptap|prosemirror|floating)|ui-primitives)/.test(dependency),
+          ),
+        },
     rolldownOptions: {
       input: {
         app: fileURLToPath(new URL("./index.html", import.meta.url)),
         "mobile-edit": fileURLToPath(new URL("./mobile-edit.html", import.meta.url)),
+        "note-print": fileURLToPath(new URL("./note-print.html", import.meta.url)),
         "tiptap-ime-test": fileURLToPath(new URL("./tiptap-ime-test.html", import.meta.url)),
       },
       output: {
         codeSplitting: {
           groups: [
+            {
+              name: "vendor-code-highlight",
+              test: /node_modules[\\/](?:lowlight|highlight\.js|@tiptap[\\/]extension-code-block-lowlight)[\\/]/,
+              priority: 50,
+              maxSize: TARGET_VENDOR_CHUNK_BYTES,
+            },
             {
               name: "vendor-react",
               test: /node_modules[\\/](react|react-dom|scheduler|react-router)[\\/]/,
@@ -196,14 +339,43 @@ export default defineConfig({
               priority: 12,
             },
             {
+              name: "vendor-mermaid-d3",
+              test: /[\\/](?:d3(?:-[^\\/@]+)?|internmap|delaunator|robust-predicates)(?:@|[\\/])/,
+              priority: 11,
+            },
+            {
+              name: "vendor-mermaid-layout",
+              test: /[\\/](?:cytoscape(?:-[^\\/@]+)?|dagre-d3-es|graphlib|roughjs|khroma|@upsetjs[\\/]venn\.js)(?:@|[\\/])/,
+              priority: 11,
+              maxSize: TARGET_VENDOR_CHUNK_BYTES,
+            },
+            {
+              name: "vendor-mermaid-render",
+              test: /[\\/](?:@mermaid-js[\\/](?:parser|tiny)|katex|dompurify|stylis|dayjs|@iconify[\\/]utils)(?:@|[\\/])/,
+              priority: 11,
+              maxSize: TARGET_VENDOR_CHUNK_BYTES,
+            },
+            {
+              name: "vendor-beautiful-mermaid",
+              test: /[\\/](?:beautiful-mermaid|elkjs|entities)(?:@|[\\/])/,
+              priority: 13,
+              maxSize: TARGET_VENDOR_CHUNK_BYTES,
+            },
+            {
               name: "ui-primitives",
               test: /src[\\/]components[\\/]ui[\\/]/,
               priority: 10,
             },
             {
               name: "vendor",
-              test: /node_modules[\\/]/,
+              // Keep Mermaid's internally lazy-loaded diagram modules out of the
+              // catch-all vendor chunk so they remain on-demand. Entry-aware
+              // splitting also prevents dependencies used only by lazy settings,
+              // export, and template screens from leaking into the app entry.
+              test: /^(?!.*(?:[\\/]mermaid@|node_modules[\\/]mermaid[\\/])).*node_modules[\\/]/,
               priority: 5,
+              entriesAware: true,
+              maxSize: TARGET_VENDOR_CHUNK_BYTES,
             },
           ],
         },

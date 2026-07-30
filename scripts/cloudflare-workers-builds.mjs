@@ -114,7 +114,7 @@ const buildVariables = () => {
   for (const name of runtimeNames) {
     const scoped = instanceKey ? `EDGE_EVER_${instanceKey}_${name}` : "";
     const key = scoped && merged.get(scoped)?.trim() ? scoped : `EDGE_EVER_${name}`;
-    const current = merged.get(key)?.trim();
+    const current = merged.get(key)?.trim() || (name === "AUTH_USERNAME" ? "admin" : "");
     if (current) entries.push([key, current]);
   }
 
@@ -133,7 +133,7 @@ const triggerPayload = (workerTag, repoConnectionUuid, buildTokenUuid) => ({
   repo_connection_uuid: repoConnectionUuid,
   build_token_uuid: buildTokenUuid,
   trigger_name: "Deploy EdgeEver production",
-  build_command: "bun install --frozen-lockfile && bun run build:cloudflare",
+  build_command: "bun install --frozen-lockfile && EDGE_EVER_DEPLOYMENT_TRIGGER=main_push EDGE_EVER_DEPLOYMENT_METHOD=cloudflare_workers_builds bun run build:cloudflare",
   deploy_command: "bun run deploy:cloudflare-builds",
   root_directory: "/",
   branch_includes: ["main"],
@@ -260,7 +260,7 @@ const setup = async () => {
   const scripts = await request("GET", `/accounts/${accountId}/workers/scripts`);
   const worker = scripts?.find((script) => script.id === workerName);
   if (!worker?.tag) {
-    throw new Error(`Worker ${workerName} was not found. Complete the first bun run deploy before enabling Workers Builds.`);
+    throw new Error(`Worker ${workerName} was not found. Complete the first bun run deploy:manual before enabling Workers Builds.`);
   }
 
   const buildTokens = await request("GET", `/accounts/${accountId}/builds/tokens`);

@@ -4,7 +4,7 @@ import { Star, Check, MoreHorizontal, RotateCcw, Trash2 } from "lucide-react";
 import type { MemoSummary } from "@edgeever/shared";
 import { cn } from "@/lib/utils";
 import type { MemoListDensity } from "@/lib/app-helpers";
-import { MEMO_DRAG_MIME, setMemoDragPreview } from "@/lib/app-helpers";
+import { isDefaultMemoTitle, MEMO_DRAG_MIME, setMemoDragPreview } from "@/lib/app-helpers";
 
 const MEMO_LONG_PRESS_DELAY_MS = 520;
 const MEMO_LONG_PRESS_MOVE_TOLERANCE_PX = 14;
@@ -77,7 +77,7 @@ export const MemoCard = ({
   const longPressTimerRef = useRef<number | null>(null);
   const longPressPointRef = useRef<{ x: number; y: number } | null>(null);
   const [modifierHoverActive, setModifierHoverActive] = useState(false);
-  const memoTitle = memo.title?.trim() || t("common.untitledMemo");
+  const memoTitle = memo.title?.trim() && !isDefaultMemoTitle(memo.title) ? memo.title.trim() : t("common.untitledMemo");
   const memoExcerpt = memo.excerpt.trim() || t("memoCard.emptyMemo");
   const showSelectionControl = selectionMode || checked || multiSelectKeyDown || modifierHoverActive;
   const selectionControlLabel = checked
@@ -310,7 +310,7 @@ export const MemoCard = ({
       draggable={!isTrashView}
       onDragStart={handleDragStart}
       className={cn(
-        "group overflow-hidden border border-slate-100 bg-white transition lg:rounded-none lg:border-x-0 lg:border-t-0 lg:border-slate-200 lg:shadow-none lg:last:border-b-0 transition-all duration-200 select-none",
+        "group overflow-hidden border border-slate-100 bg-white transition lg:rounded-none lg:border-x-0 lg:border-t-0 lg:border-slate-200 lg:shadow-none lg:last:border-b-0 dark:lg:border-slate-300/70 transition-all duration-200 select-none",
         listDensity === "compact" ? "rounded-md shadow-none" : "rounded-lg shadow-[0_4px_16px_rgba(15,23,42,0.045)]",
         !selectionMode && selected
           ? "lg:bg-slate-100"

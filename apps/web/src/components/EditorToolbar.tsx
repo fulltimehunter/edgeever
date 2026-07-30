@@ -12,13 +12,17 @@ import {
   ListOrdered,
   Quote,
   SquareCode,
+  ChartNoAxesCombined,
   Minus,
+  Paperclip,
+  Link2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { getActiveBlockValue } from "@/lib/app-helpers";
 import { CODE_BLOCK_LANGUAGES, getCodeBlockLanguageValue } from "@/lib/code-block";
+import { EditorTableMenu } from "@/components/EditorTableMenu";
 
 const EditorToolbarButton = ({
   active = false,
@@ -56,25 +60,10 @@ const EditorToolbarButton = ({
   </Tooltip>
 );
 
-const ToolbarDivider = () => <div className="h-6 w-px shrink-0 bg-slate-200" />;
+const ToolbarDivider = () => <div className="hidden h-6 w-px shrink-0 bg-slate-200 sm:block" />;
 
 const isToolbarEditorReady = (editor: Editor | null): editor is Editor =>
   Boolean(editor && !editor.isDestroyed && (editor as { extensionManager?: unknown }).extensionManager);
-
-const editorHasCodeBlock = (editor: Editor) => {
-  let found = false;
-
-  editor.state.doc.descendants((node) => {
-    if (node.type.name === "codeBlock") {
-      found = true;
-      return false;
-    }
-
-    return true;
-  });
-
-  return found;
-};
 
 const toggleCodeBlock = (editor: Editor) => {
   const { from, to, empty } = editor.state.selection;
@@ -98,16 +87,44 @@ const toggleCodeBlock = (editor: Editor) => {
     .run();
 };
 
+const insertMermaidDiagram = (editor: Editor) => {
+  if (editor.isActive("codeBlock")) {
+    editor.chain().focus().updateAttributes("codeBlock", { language: "mermaid" }).run();
+    return;
+  }
+
+  const { from, to } = editor.state.selection;
+  const selectedText = editor.state.doc.textBetween(from, to, "\n", "\n").trim();
+  const source = selectedText || "flowchart LR\n  A[Start] --> B[End]";
+
+  editor
+    .chain()
+    .focus()
+    .insertContentAt(
+      { from, to },
+      {
+        type: "codeBlock",
+        attrs: { language: "mermaid" },
+        content: [{ type: "text", text: source }],
+      }
+    )
+    .run();
+};
+
 export const EditorToolbar = ({
   editor,
   readOnly,
   markdownMode = false,
   onMarkdownModeChange,
+  onPickAttachment,
+  onPickNoteLink,
 }: {
   editor: Editor | null;
   readOnly: boolean;
   markdownMode?: boolean;
   onMarkdownModeChange?: () => void;
+  onPickAttachment?: () => void;
+  onPickNoteLink?: () => void;
 }) => {
   const { t } = useTranslation();
   const editorReady = isToolbarEditorReady(editor);
@@ -125,7 +142,7 @@ export const EditorToolbar = ({
     }
   };
   const codeBlockActive = isActive("codeBlock");
-  const showCodeLanguageSelector = editorReady && editorHasCodeBlock(editor);
+  const showCodeLanguageSelector = codeBlockActive;
   const codeBlockLanguage = editorReady
     ? getCodeBlockLanguageValue(editor.getAttributes("codeBlock").language)
     : "plaintext";
@@ -180,12 +197,12 @@ export const EditorToolbar = ({
   };
 
   return (
-    <TooltipProvider delayDuration={250} skipDelayDuration={100}>
-      <div className="relative border-t border-slate-200 bg-white">
+    <TooltipProvider delayDuration={0} skipDelayDuration={0}>
+      <div className="relative min-w-0 max-w-full border-t border-slate-200 bg-white">
         <div className="pointer-events-none absolute inset-y-0 left-0 z-10 w-4 bg-gradient-to-r from-white to-transparent sm:hidden" />
         <div className="pointer-events-none absolute inset-y-0 right-0 z-10 w-4 bg-gradient-to-l from-white to-transparent sm:hidden" />
         <div
-          className="flex min-h-12 items-center gap-2 overflow-x-auto px-3 py-2 [scrollbar-width:none] sm:px-5 [&::-webkit-scrollbar]:hidden"
+          className="flex min-w-0 max-w-full flex-wrap items-center gap-1 overflow-visible px-3 py-2 sm:gap-2 sm:px-5"
           role="toolbar"
           aria-label={t("editorToolbar.toolbar")}
         >
@@ -208,6 +225,30 @@ export const EditorToolbar = ({
               >
                 {markdownMode ? t("editorToolbar.switchToRichText") : t("editorToolbar.switchToMarkdown")}
               </button>
+              <ToolbarDivider />
+            </>
+          )}
+          {onPickAttachment && (
+            <>
+              <EditorToolbarButton
+                title={t("editorToolbar.attachment")}
+                disabled={readOnly}
+                onClick={onPickAttachment}
+              >
+                <Paperclip className="h-4 w-4" />
+              </EditorToolbarButton>
+              <ToolbarDivider />
+            </>
+          )}
+          {onPickNoteLink && (
+            <>
+              <EditorToolbarButton
+                title={t("editorToolbar.noteLink")}
+                disabled={readOnly}
+                onClick={onPickNoteLink}
+              >
+                <Link2 className="h-4 w-4" />
+              </EditorToolbarButton>
               <ToolbarDivider />
             </>
           )}
@@ -283,7 +324,7 @@ export const EditorToolbar = ({
 
           <ToolbarDivider />
           <EditorToolbarButton
-            title={t("editorToolbar.bulletList")}
+            title={`${t("editorToolbar.bulletList")} · ${t("editorToolbar.listIndentHint")}`}
             active={isActive("bulletList")}
             disabled={disabled}
             onClick={() => run((current) => current.chain().focus().toggleBulletList().run())}
@@ -291,7 +332,7 @@ export const EditorToolbar = ({
             <List className="h-4 w-4" />
           </EditorToolbarButton>
           <EditorToolbarButton
-            title={t("editorToolbar.orderedList")}
+            title={`${t("editorToolbar.orderedList")} · ${t("editorToolbar.listIndentHint")}`}
             active={isActive("orderedList")}
             disabled={disabled}
             onClick={() => run((current) => current.chain().focus().toggleOrderedList().run())}
@@ -338,12 +379,21 @@ export const EditorToolbar = ({
             </Select>
           )}
           <EditorToolbarButton
+            title={t("editorToolbar.mermaidDiagram")}
+            active={codeBlockActive && codeBlockLanguage === "mermaid"}
+            disabled={disabled}
+            onClick={() => run(insertMermaidDiagram)}
+          >
+            <ChartNoAxesCombined className="h-4 w-4" />
+          </EditorToolbarButton>
+          <EditorToolbarButton
             title={t("editorToolbar.horizontalRule")}
             disabled={disabled}
             onClick={() => run((current) => current.chain().focus().setHorizontalRule().run())}
           >
             <Minus className="h-4 w-4" />
           </EditorToolbarButton>
+          <EditorTableMenu editor={editor} readOnly={readOnly} />
             </>
           )}
         </div>
