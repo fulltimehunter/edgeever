@@ -13,6 +13,7 @@ import type {
   MemoRevision,
   MemoSummary,
   MemoShare,
+  MemoTemplate,
   Notebook,
   Resource,
   ResourceListItem,
@@ -20,6 +21,10 @@ import type {
   PublicMemoShare,
   TagSummary,
   TiptapDoc,
+  AiAction,
+  AiModelSettings,
+  AiProvider,
+  AiStreamEvent,
 } from "@edgeever/shared";
 
 export type EdgeEverClientOptions = {
@@ -76,6 +81,14 @@ export type MemoResponse = {
   memo: MemoDetail;
 };
 
+export type ListTemplatesResponse = {
+  templates: MemoTemplate[];
+};
+
+export type TemplateResponse = {
+  template: MemoTemplate;
+};
+
 export type MemoShareResponse = {
   share: MemoShare | null;
 };
@@ -101,6 +114,20 @@ export type MarkdownExportPage = {
 
 export type JsonBackupPage = MarkdownExportPage & {
   revisions: JsonBackupRevision[];
+};
+
+export type AiSettingsResponse = {
+  settings: AiModelSettings | null;
+  encryptionConfigured: boolean;
+};
+
+export type AiSettingsPayload = {
+  provider: AiProvider;
+  displayName: string;
+  baseUrl: string;
+  apiKey?: string;
+  modelId: string;
+  isEnabled: boolean;
 };
 
 export type MobileSyncBootstrapPage = {
@@ -206,6 +233,57 @@ export const createEdgeEverClient = (options: EdgeEverClientOptions = {}) => {
         method: "POST",
         body: JSON.stringify(payload),
       }),
+
+    getAiSettings: () => request<AiSettingsResponse>("/api/v1/ai/settings"),
+
+    testAiConnection: (payload: Omit<AiSettingsPayload, "isEnabled">) =>
+      request<{ ok: true; response: string }>("/api/v1/ai/settings/test", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+
+    updateAiSettings: (payload: AiSettingsPayload) =>
+      request<AiSettingsResponse>("/api/v1/ai/settings", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }),
+
+    streamAiGeneration: async (
+      payload: { action: AiAction; title: string; contentMarkdown: string; targetLanguage?: string },
+      streamOptions: { signal?: AbortSignal; onEvent: (event: AiStreamEvent) => void },
+    ) => {
+      const headers = new Headers({ "Content-Type": "application/json" });
+      if (options.token) headers.set("Authorization", `Bearer ${options.token}`);
+      const response = await fetchImpl(`${baseUrl}/api/v1/ai/generate`, {
+        method: "POST",
+        credentials: "include",
+        headers,
+        body: JSON.stringify(payload),
+        signal: streamOptions.signal,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null) as { error?: { code?: string; message?: string } } | null;
+        if (response.status === 401) options.onUnauthorized?.();
+        throw new ApiRequestError(body?.error?.message || response.statusText, response.status, body?.error?.code);
+      }
+      if (!response.body) throw new ApiRequestError("Streaming response is unavailable", 502, "ai_stream_unavailable");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";
+        for (const frame of frames) {
+          const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+          if (data) streamOptions.onEvent(JSON.parse(data) as AiStreamEvent);
+        }
+        if (done) break;
+      }
+      const trailingData = buffer.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+      if (trailingData) streamOptions.onEvent(JSON.parse(trailingData) as AiStreamEvent);
+    },
 
     listUsers: () => request<ListUsersResponse>("/api/v1/users"),
 
@@ -341,6 +419,14 @@ export const createEdgeEverClient = (options: EdgeEverClientOptions = {}) => {
       request<MemoResponse>("/api/v1/memos", {
         method: "POST",
         body: JSON.stringify(payload),
+      }),
+
+    listTemplates: () => request<ListTemplatesResponse>("/api/v1/templates"),
+
+    useTemplate: (templateId: string, notebookId: string) =>
+      request<MemoResponse>(`/api/v1/templates/${templateId}/use`, {
+        method: "POST",
+        body: JSON.stringify({ notebookId }),
       }),
 
     moveMemos: (payload: { memoIds: string[]; notebookId: string }) =>

@@ -36,6 +36,7 @@ The public demo resets every day at 3:00 AM (China Standard Time) and restores s
 - **Open Data, No Vendor Lock-in**: Built on standard SQLite with complete REST API, MCP, and CLI access. Your knowledge is stored transparently and accessible anytime without being locked to a single app.
 - **Lossless ZIP Backup & Portability**: Export your complete library as a clean archive containing Markdown, Front Matter, nested folders, relative attachment links, and version histories for instant restoration anywhere.
 - **Native AI Agent Synergy**: Deep integration with Model Context Protocol (MCP) allows AI tools like Claude Code, Codex, and Antigravity to read, organize, and summarize your notes, or sync seamlessly with Notion and Feishu Bitable.
+- **Bring Your Own AI Model**: Connect an OpenAI-compatible, Anthropic, or Gemini cloud endpoint with your own Base URL and API key, then summarize notes, extract key points or tasks, rewrite and proofread, or translate from a reviewable streaming draft.
 - **Unlimited Multi-Device Sync**: No commercial device caps or paywalls. Enjoy seamless synchronization across PC, tablet, and mobile via web, PWA, or browser.
 - **Classic Three-Pane Layout & Focus Mode**: Clean navigation featuring notebook trees, note lists, and an expansive editor, with a desktop focus mode to eliminate distractions.
 - **Unlimited Nested Notebooks**: Organize your knowledge with arbitrary folder depth.
@@ -108,7 +109,7 @@ Developers can also use the [extension development guide](apps/extension/README.
 
 Native clients offer a smoother, more reliable experience with deeper system integration, local storage, and offline editing. Changes sync incrementally when connectivity returns, making them ideal for frequent use and unreliable network conditions.
 
-The Android app is now available on [Google Play](https://play.google.com/store/apps/details?id=org.edgeever.mobile), with signed APKs also available from [GitHub Releases](https://github.com/tianma-if/edgeever/releases). The iOS app has been submitted and is currently under App Store review.
+The Android app is now available on [Google Play](https://play.google.com/store/apps/details?id=org.edgeever.mobile), with signed APKs also available from [GitHub Releases](https://github.com/tianma-if/edgeever/releases). The iOS client is a native SwiftUI app in `apps/ios` and has been submitted for App Store review.
 
 The macOS app is available from [GitHub Releases](https://github.com/tianma-if/edgeever/releases). The Windows version will be released once the code-signing certificate issue is resolved.
 
@@ -124,42 +125,17 @@ On platforms without a native client, EdgeEver can be installed as a PWA using C
 - Official site: Astro static site in `apps/site`, deployable to Cloudflare Pages.
 - Frontend: Vite, React, React Router, TanStack Query, Tailwind CSS, shadcn/ui, and Radix UI.
 - Editor: TipTap / ProseMirror with Markdown support; PWA uses vite-plugin-pwa, Workbox, and Dexie.
-- Mobile app: Expo + React Native, with SQLite local storage and incremental sync.
+- Android app: Expo + React Native in `apps/mobile`, with SQLite local storage and incremental sync.
+- iOS app: Native SwiftUI in `apps/ios` (iOS 17+), with a packaged TipTap EditorBundle, GRDB local mirror/outbox, and Android-aligned shell chrome.
 - Native desktop app: Electron + Rust sidecar combines a consistent cross-platform experience with high-performance local data services; SQLite enables offline editing, incremental sync when back online, and local backups.
 - Web clipper: Manifest V3, Mozilla Readability, and Turndown for Chrome, Microsoft Edge, and Firefox.
 - Backend: Cloudflare Workers, Hono, Zod, D1, and R2, with REST API, OpenAPI, and Remote MCP.
 
 ## Quick Start
 
-Install dependencies:
-
 ```sh
 bun install
-```
-
-Apply local D1 migrations:
-
-```sh
-bun run db:migrate:local
-```
-
-Start the default development environment. It applies pending local migrations and initializes local D1/R2 stores once with the repository's fixed demo seed. Existing local changes are preserved on later restarts, and no remote instance is contacted.
-
-```sh
 bun run dev
-```
-
-To intentionally develop against a configured remote instance, select it explicitly:
-
-```sh
-EDGE_EVER_INSTANCE=<name> bun run dev:remote
-```
-
-Checks:
-
-```sh
-bun run typecheck
-bun run build
 ```
 
 ## Project Structure
@@ -168,7 +144,8 @@ bun run build
 apps/web          Vite + React frontend, PWA, offline drafts, and sync queue
 apps/extension    Chrome/Edge/Firefox Manifest V3 web clipper
 apps/api          Cloudflare Worker + Hono API, OpenAPI, MCP endpoint
-apps/mobile       Expo + React Native mobile app
+apps/mobile       Expo + React Native Android app
+apps/ios          Native SwiftUI iOS app (TipTap EditorBundle, GRDB)
 apps/desktop      Electron desktop shell, preload bridge, and native packaging
 apps/site         Astro official website, deployable independently
 packages/client   Shared API client for web and mobile apps
@@ -178,7 +155,7 @@ crates/desktop-sidecar
 scripts           Wrangler wrapper, password hash, CLI, MCP stdio bridge, Evernote ENEX import
 migrations        D1 database migrations
 docs              OpenAPI schema, architecture, migration, and deployment docs
-.github/workflows CI for web, mobile, desktop packaging, deployment, and releases
+.github/workflows CI for web, mobile, iOS, desktop packaging, deployment, and releases
 wrangler.toml     Cloudflare Workers, Assets, D1, R2 configuration
 ```
 
@@ -210,6 +187,12 @@ Create an API token in **Profile** -> **MCP settings**, then give the token or f
 
 With MCP, EdgeEver can also connect to tools such as Notion databases and Feishu Bitable, turning scattered ideas, information, and materials from everyday notes into structured data that is easier to organize, search, and manage.
 
+## Bring Your Own AI Model
+
+Open **Profile → AI Integrations** to connect an OpenAI-compatible, Anthropic Messages, or Google Gemini cloud endpoint with your own Base URL, API key, and model ID. The first AI release focuses on note processing: summarizing, extracting key points, extracting tasks, rewriting and proofreading, and translating. Results stream into a reviewable draft before you copy, append, or replace content.
+
+AI requests are sent by the EdgeEver server rather than directly by the browser or native client. Model credentials are isolated by personal workspace and encrypted before being stored. Standard deployments automatically derive an AI-specific encryption key from the existing instance authentication secret, so no additional deployment variable is required. The same AI business code runs in Cloudflare Workers and the planned Docker/Bun runtime.
+
 ## Image Compression
 
 Image compression happens in the Web client before upload and is controlled by the **Compress note images** setting. When enabled, PNG, JPEG, WebP, and AVIF files are converted to WebP when beneficial, with the longest edge limited to `2560px`. If compression does not reduce size, the original file is kept.
@@ -220,7 +203,7 @@ EdgeEver avoids Worker-side image processing to reduce compute and image-process
 
 The instance owner can open **Settings → Advanced → OSS object storage** to send new images and attachments to an S3-compatible service such as Alibaba Cloud OSS, Tencent COS, AWS S3, MinIO, or R2. Existing resources stay in their original store, so changing the default does not migrate or break historical attachments.
 
-Before saving third-party credentials on a Cloudflare deployment, configure the `EDGE_EVER_STORAGE_ENCRYPTION_KEY` Worker Secret with a random value of at least 32 characters. EdgeEver uses this instance-level key to encrypt the access secret stored in D1. Keep the key stable and backed up; it is required to read resources that use the external store.
+Before saving third-party object-storage credentials on a Cloudflare deployment, configure the `EDGE_EVER_STORAGE_ENCRYPTION_KEY` Worker Secret with a random value of at least 32 characters. EdgeEver uses this instance-level key to encrypt the access secret stored in D1. Keep the key stable and backed up; changing it makes previously saved object-storage credentials unusable.
 
 ## Migration
 

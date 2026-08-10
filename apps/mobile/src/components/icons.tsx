@@ -1,9 +1,15 @@
 import Feather from "@expo/vector-icons/Feather";
 import type { ComponentProps } from "react";
+import { ActivityIndicator as NativeActivityIndicator, type ActivityIndicatorProps } from "react-native";
 import { resolveMobileThemeColor, useMobileTheme } from "../lib/mobile-theme";
 
 type FeatherName = ComponentProps<typeof Feather>["name"];
 type IconProps = Omit<ComponentProps<typeof Feather>, "name">;
+
+export const ActivityIndicator = ({ color, ...props }: ActivityIndicatorProps) => {
+  const { resolvedTheme } = useMobileTheme();
+  return <NativeActivityIndicator {...props} color={resolveMobileThemeColor(color as string | undefined, resolvedTheme)} />;
+};
 
 const createIcon = (name: FeatherName) => {
   const Icon = ({ color, ...props }: IconProps) => {
@@ -19,6 +25,7 @@ export const AlertTriangle = createIcon("alert-triangle");
 export const ArrowUpCircle = createIcon("arrow-up-circle");
 export const BookOpen = createIcon("book-open");
 export const Bold = createIcon("bold");
+export const Camera = createIcon("camera");
 export const Check = createIcon("check");
 export const CheckSquare = createIcon("check-square");
 export const ChevronDown = createIcon("chevron-down");
@@ -43,6 +50,7 @@ export const ImagePlus = createIcon("plus-square");
 export const Info = createIcon("info");
 export const Italic = createIcon("italic");
 export const KeyRound = createIcon("key");
+export const LayoutTemplate = createIcon("layout");
 export const Link = createIcon("link");
 export const List = createIcon("list");
 export const LockKeyhole = createIcon("lock");
@@ -65,6 +73,7 @@ export const Share2 = createIcon("share-2");
 export const ShieldCheck = createIcon("shield");
 export const SlidersHorizontal = createIcon("sliders");
 export const Sparkles = createIcon("star");
+export const Square = createIcon("square");
 export const Sun = createIcon("sun");
 export const Tag = createIcon("tag");
 export const Trash2 = createIcon("trash-2");

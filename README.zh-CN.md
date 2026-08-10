@@ -36,6 +36,7 @@ EdgeEver 是一款现代化的开源笔记工作区。它为你找回经典印�
 - **数据开放，不设围墙**：基于标准 SQLite 存储，提供 REST API、MCP 与 CLI 接口。数据随时可读可导，不再担心被任何特定平台绑定。
 - **无损 ZIP 打包与无缝迁移**：一键打包导出包含 Markdown、Front Matter、嵌套目录及附件的完整档案，同时保留历史版本与结构化数据，方便在不同实例间完整还原。
 - **原生 AI Agent 智脑联动**：内置 MCP（Model Context Protocol）协议，支持 Claude Code、Codex、Antigravity 等 AI 助手直接读取与整理笔记，也可与 Notion Database、飞书多维表格轻松打通。
+- **接入自己的 AI 模型**：使用自己的 Base URL 和 API Key 连接 OpenAI 兼容、Anthropic 或 Gemini 云端服务，对当前笔记进行总结、提炼要点、提取待办、改写与校对或翻译，结果确认后再应用。
 - **多端无缝同步，无设备限制**：自托管数据无商业限制，摆脱免费账号仅限 2 台设备的束缚，在 PC、平板与手机上随心同步。
 - **经典三栏布局与专注模式**：笔记本树、笔记列表与编辑区一目了然；桌面端一键开启专注模式，让思绪尽情铺满屏幕。
 - **无限层级笔记本**：轻松构建清晰的多级目录结构。
@@ -108,7 +109,7 @@ EdgeEver 采用纯 Serverless 架构，完全运行在 Cloudflare 免费配额�
 
 原生客户端提供更流畅、稳定的使用体验，以及更完善的系统级集成，并支持本地存储与离线编辑。恢复联网后，内容会自动增量同步，适合高频使用和弱网场景。
 
-Android App 现已上架 [Google Play](https://play.google.com/store/apps/details?id=org.edgeever.mobile)，也可从 [GitHub Releases](https://github.com/tianma-if/edgeever/releases) 下载签名 APK。iOS App 已提交，目前仍在 App Store 审核中。
+Android App 现已上架 [Google Play](https://play.google.com/store/apps/details?id=org.edgeever.mobile)，也可从 [GitHub Releases](https://github.com/tianma-if/edgeever/releases) 下载签名 APK。iOS 客户端为 `apps/ios` 下的原生 SwiftUI 应用，已提交 App Store，目前仍在审核中。
 
 macOS App 可从 [GitHub Releases](https://github.com/tianma-if/edgeever/releases) 下载。Windows 版本正在处理代码签名证书问题，解决后即可发布。
 
@@ -134,42 +135,17 @@ macOS App 可从 [GitHub Releases](https://github.com/tianma-if/edgeever/release
 - 官网：Astro 静态站点，位于 `apps/site`，可独立构建并部署到 Cloudflare Pages。
 - 前端：Vite、React、React Router、TanStack Query，UI 基于 Tailwind CSS、shadcn/ui、Radix UI。
 - 编辑器：TipTap / ProseMirror，支持 Markdown；PWA 使用 vite-plugin-pwa、Workbox、Dexie。
-- 移动 App：Expo + React Native，采用 SQLite 本地存储与增量同步。
+- Android App：`apps/mobile` 中的 Expo + React Native，采用 SQLite 本地存储与增量同步。
+- iOS App：`apps/ios` 中的原生 SwiftUI（iOS 17+），内置 TipTap EditorBundle、GRDB 本地镜像/outbox，界面与 Android 壳层对齐。
 - 原生桌面端：Electron + Rust sidecar，兼顾跨平台一致体验与高性能本地数据服务；基于 SQLite 支持离线编辑、联网后增量同步与本地备份。
 - 网页裁剪：Manifest V3、Mozilla Readability、Turndown，支持 Chrome、Microsoft Edge 与 Firefox。
 - 后端：Cloudflare Workers、Hono、Zod、D1、R2，提供 REST API、OpenAPI 与 Remote MCP。
 
 ## 快速开始
 
-安装依赖：
-
 ```sh
 bun install
-```
-
-应用本地 D1 迁移：
-
-```sh
-bun run db:migrate:local
-```
-
-启动默认开发环境。它会先应用本地迁移，并在首次启动时使用仓库内固定的 Demo 种子初始化本地 D1/R2；后续重启会保留本地修改，且不会连接任何远程实例。
-
-```sh
 bun run dev
-```
-
-如需明确连接已配置的远程实例，必须显式指定实例名：
-
-```sh
-EDGE_EVER_INSTANCE=<实例名> bun run dev:remote
-```
-
-常用检查：
-
-```sh
-bun run typecheck
-bun run build
 ```
 
 ## 目录结构
@@ -178,7 +154,8 @@ bun run build
 apps/web          Vite + React 前端、PWA、离线草稿与同步队列
 apps/extension    Chrome/Edge/Firefox Manifest V3 网页裁剪插件
 apps/api          Cloudflare Worker + Hono API、OpenAPI、MCP endpoint
-apps/mobile       Expo + React Native 移动端 App
+apps/mobile       Expo + React Native Android App
+apps/ios          原生 SwiftUI iOS App（TipTap EditorBundle、GRDB）
 apps/desktop      Electron 桌面端壳层、preload bridge 与原生打包配置
 apps/site         Astro 官方网站，可独立部署
 packages/client   Web 与移动端共享的 API Client
@@ -188,7 +165,7 @@ crates/desktop-sidecar
 scripts           Wrangler 封装、密码 hash、CLI、MCP stdio bridge、Evernote ENEX 导入
 migrations        D1 数据库迁移
 docs              OpenAPI schema、架构、迁移与部署文档
-.github/workflows Web、移动端、桌面端打包、部署与 Release 的 CI
+.github/workflows Web、移动端、iOS、桌面端打包、部署与 Release 的 CI
 wrangler.toml     Cloudflare Workers、Assets、D1、R2 配置
 ```
 
@@ -221,6 +198,13 @@ https://你的域名/api/openapi.json
 > 放飞你的思路，这种情况下是有很多灵活玩法：
 比如让AI Agent归纳你随机记录的灵感创意、针对你的笔记做精准的人物画像、构建自己的知识图谱、自动为笔记打标签）
 借助 MCP，EdgeEver 还可以与 Notion Database、飞书多维表格等工具联动，把日常笔记中零散的灵感、信息和素材沉淀到结构化数据库中，方便后续整理、检索与管理。
+
+## 接入自己的 AI 模型
+
+进入**个人中心 → AI 集成**，可以使用自己的 Base URL、API Key 和模型 ID 连接 OpenAI 兼容协议、Anthropic Messages 或 Google Gemini 云端服务。第一版 AI 功能聚焦笔记内容处理：总结、提炼要点、提取待办、改写与校对以及翻译。模型结果会先作为流式草稿展示，确认后才能复制、追加或替换正文。
+
+AI 请求统一由 EdgeEver 服务端发出，不会由浏览器或原生客户端直接携带模型密钥。模型凭据按个人工作区隔离并加密保存；标准部署会自动从已有的实例认证 Secret 派生 AI 专用加密密钥，不需要增加任何部署变量。Cloudflare Worker 与未来的 Docker/Bun 运行时共用同一套 AI 业务代码。
+
 ## 图片压缩规则
 
 图片压缩仅在 Web 端上传前执行，由设置页的“压缩笔记内图片”开关控制。启用后，浏览器会把 PNG、JPEG、WebP、AVIF 尝试压缩为 WebP，并将最长边限制在 `2560px` 以内；如果压缩结果不比原图小，则保留原图。
@@ -231,7 +215,7 @@ Cloudflare Worker 侧执行图片处理会消耗计算/图片处理额度，因�
 
 实例 Owner 可以进入**设置 → 高级设置 → OSS 对象存储**，让后续上传的图片和附件写入兼容 S3 API 的阿里云 OSS、腾讯云 COS、AWS S3、MinIO 或 R2。已有资源继续保留在原存储中，因此切换默认存储不会迁移历史附件，也不会让历史附件失效。
 
-在 Cloudflare 部署中保存第三方凭据前，需要先配置一个至少 32 个字符的随机 `EDGE_EVER_STORAGE_ENCRYPTION_KEY` Worker Secret。EdgeEver 会用这个实例级密钥加密保存在 D1 中的访问密钥。请保持该密钥稳定并妥善备份；读取外部存储中的资源时仍需要它。
+在 Cloudflare 部署中保存第三方对象存储凭据前，需要先配置一个至少 32 个字符的随机 `EDGE_EVER_STORAGE_ENCRYPTION_KEY` Worker Secret。EdgeEver 会用这个实例级密钥加密保存在 D1 中的对象存储 Secret。请保持该密钥稳定并妥善备份；更换密钥会导致之前保存的对象存储凭据无法继续使用。
 
 ## 导入与迁移 (Migration)
 

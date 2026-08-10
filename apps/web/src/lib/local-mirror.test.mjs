@@ -32,6 +32,7 @@ const {
   createLocalResource,
   listLocalResources,
   replaceLocalResources,
+  remapLocalDraftMemoId,
 } = await import("./local-mirror.ts");
 const { getCachedLocalResourceBytes } = await import("./local-resource-cache.ts");
 
@@ -56,6 +57,28 @@ afterEach(async () => {
 });
 
 describe("local mirror", () => {
+  test("keeps the newest draft when memo ids are remapped more than once", async () => {
+    await localDb.drafts.put({
+      memoId: "local-memo",
+      title: "Older draft",
+      tagsText: "",
+      contentJson: { type: "doc", content: [] },
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    await localDb.drafts.put({
+      memoId: "remote-memo",
+      title: "Newer draft",
+      tagsText: "",
+      contentJson: { type: "doc", content: [] },
+      updatedAt: "2026-01-02T00:00:00.000Z",
+    });
+
+    await remapLocalDraftMemoId("local-memo", "remote-memo");
+
+    expect(await localDb.drafts.get("local-memo")).toBeUndefined();
+    expect(await localDb.drafts.get("remote-memo")).toMatchObject({ title: "Newer draft" });
+  });
+
   test("creates and lists a memo without a network request", async () => {
     const scope = createLocalDataScope("https://demo.edgeever.org", "user-1");
     const memo = await createLocalMemo(scope, {
@@ -157,7 +180,10 @@ describe("local mirror", () => {
     const second = await createLocalMemo(scope, { notebookId: "inbox", title: "Second", contentMarkdown: "two", tags: ["b"] });
     const merged = await mergeLocalMemos(scope, { memoIds: [first.id, second.id], title: "Merged" });
     expect(merged?.title).toBe("Merged");
-    expect(merged?.contentMarkdown).toContain("one\n\n---\n\ntwo");
+    expect(merged?.contentMarkdown).toContain("one");
+    expect(merged?.contentMarkdown).toContain("two");
+    expect(merged?.contentMarkdown).toContain("edgeever:merge-divider");
+    expect(merged?.contentJson?.content?.some((node) => node.type === "edgeeverMergeDivider")).toBe(true);
     expect(merged?.sourceMemoIds).toEqual([first.id, second.id]);
     expect((await getLocalMemo(scope, first.id))?.isDeleted).toBe(true);
     expect((await getLocalMemo(scope, second.id))?.mergedIntoMemoId).toBe(merged?.id);

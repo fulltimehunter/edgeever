@@ -3,7 +3,7 @@
     "name": "EdgeEver",
     "slug": "edgeever",
     "scheme": "edgeever",
-    "version": "1.12.5",
+    "version": "1.16.0",
     "runtimeVersion": {
       "policy": "appVersion"
     },
@@ -24,13 +24,18 @@
       "supportsTablet": false,
       "config": {
         "usesNonExemptEncryption": false
+      },
+      "infoPlist": {
+        "UIRequiresFullScreen": true,
+        "NSMicrophoneUsageDescription": "EdgeEver only uses the microphone if web content inside a note explicitly requests it.",
+        "NSCameraUsageDescription": "Allow EdgeEver to use your camera to take photos and insert them into your notes."
       }
     },
     "android": {
       "package": "org.edgeever.mobile",
-      "versionCode": 85,
+      "versionCode": 98,
       "adaptiveIcon": {
-        "backgroundColor": "#d1fae5",
+        "backgroundColor": "#16A06E",
         "backgroundImage": "./assets/icon.png",
         "foregroundImage": "./assets/adaptive-icon-transparent.png"
       }
@@ -39,9 +44,17 @@
       "expo-router",
       "expo-secure-store",
       [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Allow EdgeEver to take photos and insert them into your notes.",
+          "microphonePermission": false,
+          "photosPermission": "Allow EdgeEver to choose photos to insert into your notes."
+        }
+      ],
+      [
         "expo-splash-screen",
         {
-          "backgroundColor": "#D9FAEA",
+          "backgroundColor": "#16A06E",
           "image": "./assets/icon.png",
           "imageWidth": 180,
           "resizeMode": "contain"
