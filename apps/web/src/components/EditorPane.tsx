@@ -2,6 +2,7 @@ import { useRef, useState, useEffect, useCallback, useMemo, type CSSProperties, 
 import { createPortal } from "react-dom";
 import { useQuery, useQueryClient, useMutation } from "@tanstack/react-query";
 import { useEditor, EditorContent, type Editor } from "@tiptap/react";
+import { BubbleMenu } from "@tiptap/react/menus";
 import type { Mark } from "@tiptap/pm/model";
 import StarterKit from "@tiptap/starter-kit";
 import { TaskItem, TaskList } from "@tiptap/extension-list";
@@ -34,6 +35,7 @@ import {
   LoaderCircle,
   Info,
   FileDown,
+  FileCode2,
   Printer,
   Link2,
   Copy,
@@ -129,6 +131,8 @@ import { SystemInfoDialog } from "./SystemInfoDialog";
 import { fetchLatestRelease, isVersionOutdated } from "@/lib/version-check";
 import { RELEASE_STATUS_EVENT } from "@/lib/release-notice";
 import { downloadMarkdownFile } from "@/lib/note-markdown-export";
+import { NOTE_HTML_FULL_STYLES } from "@/lib/note-html-export-assets";
+import { downloadNoteHtmlFile, getHtmlImageEmbedNoticeKind } from "@/lib/note-html-export";
 import { openNotePrintPreview, serializeNoteDocumentForPrint } from "@/lib/note-print";
 import { isBrowserOffline } from "@/lib/network-status";
 import {
@@ -147,6 +151,11 @@ import { processFilesSequentially } from "@/lib/file-batch";
 import { MEMO_ID_REMAPPED_EVENT, MEMO_SYNC_ACKNOWLEDGED_EVENT } from "@/lib/sync-events";
 import { useStandaloneMobileEditor } from "@/hooks/useStandaloneMobileEditor";
 import { statusSettleMotion } from "@/lib/motion";
+import {
+  getRichTextAiSelectionContext,
+  getRichTextAiSelectionReplacement,
+  normalizeAiSelectionReplacement,
+} from "@/lib/ai-selection-replacement";
 import { getAttachmentFilenameFromLabel, getAttachmentResourceId } from "@/lib/attachment-links";
 import {
   IMAGE_MENU_HIDE_EVENT,
@@ -201,6 +210,19 @@ type NoteLinkHintPosition = {
   left: number;
   top: number;
   placement: "above" | "below" | "inside-bottom-right";
+};
+
+type AiSelectionContext = {
+  kind: "markdown" | "plain";
+  from: number;
+  to: number;
+  contentMarkdown: string;
+} | {
+  kind: "rich";
+  from: number;
+  to: number;
+  contentMarkdown: string;
+  isInline: boolean;
 };
 
 const getAttachmentLinkFromEventTarget = (target: EventTarget | null) =>
@@ -588,6 +610,7 @@ type EditorPaneProps = {
   onDocumentActionConsumed?: (requestId: number) => void;
   selectionActionBar?: ReactNode;
   onOpenMemo?: (memoId: string) => void;
+  onOpenAiPrompts?: () => void;
 };
 
 type RichEditorPaneProps = EditorPaneProps & {
@@ -651,6 +674,7 @@ const RichEditorPane = ({
   onDocumentActionConsumed,
   selectionActionBar,
   onOpenMemo,
+  onOpenAiPrompts,
   onRequestMobileNativeEdit,
 }: RichEditorPaneProps) => {
   const { t, i18n } = useTranslation();
@@ -679,6 +703,7 @@ const RichEditorPane = ({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
   const [aiAssistantOpen, setAiAssistantOpen] = useState(false);
+  const [aiSelection, setAiSelection] = useState<AiSelectionContext | null>(null);
   const [systemInfoOpen, setSystemInfoOpen] = useState(false);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [mobileNotebookSheetOpen, setMobileNotebookSheetOpen] = useState(false);
@@ -1799,7 +1824,73 @@ const RichEditorPane = ({
       : memoRef.current?.contentMarkdown ?? "";
   }, [editor, getMobilePlainTextValue, markdownSource, useMarkdownSourceEditor, useMobilePlainTextEditor]);
 
+  const openAiAssistant = useCallback(() => {
+    let selection: AiSelectionContext | null = null;
+
+    if (useMobilePlainTextEditor) {
+      const source = getMobilePlainTextValue();
+      const plainTextElement = mobileTextAreaRef.current;
+      const from = plainTextElement instanceof HTMLTextAreaElement ? plainTextElement.selectionStart : 0;
+      const to = plainTextElement instanceof HTMLTextAreaElement ? plainTextElement.selectionEnd : from;
+      const contentMarkdown = source.slice(from, to).trim();
+      if (to > from && contentMarkdown) selection = { kind: "plain", from, to, contentMarkdown };
+    } else if (useMarkdownSourceEditor) {
+      const from = markdownTextAreaRef.current?.selectionStart ?? 0;
+      const to = markdownTextAreaRef.current?.selectionEnd ?? from;
+      const contentMarkdown = markdownSource.slice(from, to).trim();
+      if (to > from && contentMarkdown) selection = { kind: "markdown", from, to, contentMarkdown };
+    } else if (isEditorReady(editor)) {
+      const richSelection = getRichTextAiSelectionContext(editor.state.doc, editor.state.selection);
+      if (richSelection) selection = { kind: "rich", ...richSelection };
+    }
+
+    setAiSelection(selection);
+    setAiAssistantOpen(true);
+  }, [editor, getMobilePlainTextValue, markdownSource, useMarkdownSourceEditor, useMobilePlainTextEditor]);
+
+  const handleAiAssistantOpenChange = useCallback((nextOpen: boolean) => {
+    setAiAssistantOpen(nextOpen);
+    if (!nextOpen) setAiSelection(null);
+  }, []);
+
   const applyAiDraft = useCallback((draft: string, mode: "append" | "replace") => {
+    if (mode === "replace" && aiSelection) {
+      const replacementDraft = normalizeAiSelectionReplacement(draft);
+      if (!replacementDraft) return;
+
+      if (aiSelection.kind === "plain") {
+        const source = getMobilePlainTextValue();
+        const { next, caret } = insertMarkdownSnippet(source, replacementDraft, aiSelection.from, aiSelection.to);
+        setMobilePlainText(next);
+        setMobilePlainTextElementValue(mobileTextAreaRef.current, next);
+        persistCurrentDraft(title, tagsText, next);
+        window.requestAnimationFrame(() => {
+          const plainTextElement = mobileTextAreaRef.current;
+          plainTextElement?.focus();
+          if (plainTextElement instanceof HTMLTextAreaElement) plainTextElement.setSelectionRange(caret, caret);
+        });
+      } else if (aiSelection.kind === "markdown") {
+        const { next, caret } = insertMarkdownSnippet(markdownSource, replacementDraft, aiSelection.from, aiSelection.to);
+        setMarkdownSource(next);
+        window.requestAnimationFrame(() => {
+          markdownTextAreaRef.current?.focus();
+          markdownTextAreaRef.current?.setSelectionRange(caret, caret);
+        });
+      } else if (aiSelection.kind === "rich" && isEditorReady(editor)) {
+        const maxPos = editor.state.doc.content.size;
+        const from = Math.max(1, Math.min(aiSelection.from, maxPos));
+        const to = Math.max(from, Math.min(aiSelection.to, maxPos));
+        editor.chain().focus().insertContentAt(
+          { from, to },
+          getRichTextAiSelectionReplacement(replacementDraft, aiSelection.isInline),
+        ).run();
+      }
+      markDirty();
+      setAiSelection(null);
+      setAiAssistantOpen(false);
+      return;
+    }
+
     const current = getCurrentMarkdownForAi();
     const next = mode === "append" && current.trim()
       ? `${current.replace(/\s+$/, "")}\n\n${draft}`
@@ -1814,8 +1905,9 @@ const RichEditorPane = ({
       editor.commands.setContent(markdownToDoc(next));
     }
     markDirty();
+    setAiSelection(null);
     setAiAssistantOpen(false);
-  }, [editor, getCurrentMarkdownForAi, markDirty, persistCurrentDraft, tagsText, title, useMarkdownSourceEditor, useMobilePlainTextEditor]);
+  }, [aiSelection, editor, getCurrentMarkdownForAi, getMobilePlainTextValue, markDirty, markdownSource, persistCurrentDraft, tagsText, title, useMarkdownSourceEditor, useMobilePlainTextEditor]);
 
   const getCurrentContentJson = useCallback((): TiptapDoc | null => {
     if (useMobilePlainTextEditor) {
@@ -1961,6 +2053,9 @@ const RichEditorPane = ({
       }
 
       const resolvedDraft = resolveEditorDraftState({ memo, draft, queuedUpdate });
+      if (draft && !queuedUpdate && resolvedDraft.source === "memo") {
+        await localDb.drafts.delete(memo.id);
+      }
       const {
         title: nextTitle,
         tagsText: nextTagsText,
@@ -2012,7 +2107,14 @@ const RichEditorPane = ({
 
       hydratingRef.current = true;
       editingMemoIdRef.current = memo.id;
-      setHasUnsavedChanges(nextHasUnsavedChanges);
+      if (nextHasUnsavedChanges) {
+        // A recovered draft is a real save request, not merely a label state.
+        // Incrementing dirtyVersion guarantees the autosave effect is armed
+        // after the editor and local edit session finish hydrating.
+        markDirtyStatus();
+      } else {
+        setHasUnsavedChanges(false);
+      }
       if (queuedUpdate) {
         const nextState = syncStatusToSaveState(queuedUpdate.status);
         setSaveState(nextState);
@@ -2324,6 +2426,60 @@ const RichEditorPane = ({
     useMobilePlainTextEditor,
   ]);
 
+  const handleExportHtml = useCallback(async () => {
+    if (!isEditorReady(editor) || !memo) {
+      return;
+    }
+
+    const currentDocument = useMobilePlainTextEditor
+      ? markdownToDoc(getMobilePlainTextValue())
+      : useMarkdownSourceEditor
+        ? markdownToDoc(markdownSource)
+        : editor.getJSON() as TiptapDoc;
+    const bodyHtml = serializeNoteDocumentForPrint(editor, currentDocument);
+
+    try {
+      const { images } = await downloadNoteHtmlFile({
+        bodyHtml,
+        title: title.trim() || t("common.untitledMemo"),
+        notebook: notebookOptions.find((notebook) => notebook.id === memo.notebookId)?.name ?? "",
+        tags: parseTagsText(tagsText),
+        updatedAt: formatDateTime(memo.updatedAt),
+        language: i18n.resolvedLanguage ?? i18n.language,
+        fallbackTitle: t("common.untitledMemo"),
+        styles: NOTE_HTML_FULL_STYLES,
+      });
+
+      const noticeKind = getHtmlImageEmbedNoticeKind(images);
+      if (noticeKind === "partial") {
+        window.alert(t("editor.htmlExport.imageEmbedPartial", {
+          embedded: images.embedded,
+          total: images.total,
+          failed: images.failed,
+        }));
+      } else if (noticeKind === "failed-all") {
+        window.alert(t("editor.htmlExport.imageEmbedFailed", {
+          total: images.total,
+        }));
+      }
+    } catch {
+      window.alert(t("editor.htmlExport.error"));
+    }
+  }, [
+    editor,
+    getMobilePlainTextValue,
+    i18n.language,
+    i18n.resolvedLanguage,
+    markdownSource,
+    memo,
+    notebookOptions,
+    t,
+    tagsText,
+    title,
+    useMarkdownSourceEditor,
+    useMobilePlainTextEditor,
+  ]);
+
   const handleSaveAsTemplate = useCallback(() => {
     if (!memo) {
       return;
@@ -2368,6 +2524,9 @@ const RichEditorPane = ({
       case "export-markdown":
         handleExportMarkdown();
         break;
+      case "export-html":
+        void handleExportHtml();
+        break;
       case "export-pdf":
         handleExportPdf(documentActionRequest.printWindow);
         break;
@@ -2378,6 +2537,7 @@ const RichEditorPane = ({
   }, [
     documentActionRequest,
     editor,
+    handleExportHtml,
     handleExportMarkdown,
     handleExportPdf,
     handleSaveAsTemplate,
@@ -2517,6 +2677,12 @@ const RichEditorPane = ({
       setSaveState("error");
     },
   });
+  // useMutation returns a new result object on every render. Depending on the
+  // whole object makes autosave timers restart during unrelated renders and
+  // can starve a recovered draft indefinitely. These members are stable (or
+  // primitive) and are safe effect dependencies.
+  const mutateSave = saveMutation.mutate;
+  const saveMutationPending = saveMutation.isPending;
 
   const replaceAttachmentLabel = useCallback((target: AttachmentMenuTarget, filename: string) => {
     const activeEditor = editorRef.current;
@@ -2706,15 +2872,15 @@ const RichEditorPane = ({
         !memoRef.current ||
         memoRef.current.isDeleted ||
         !hasUnsavedChangesRef.current ||
-        saveMutation.isPending ||
+        saveMutationPending ||
         saveState === "conflict"
       ) {
         return;
       }
 
-      saveMutation.mutate();
+      mutateSave();
     }, EDITOR_LOCAL_SAVE_DELAY_MS);
-  }, [getMobilePlainTextValue, persistCurrentDraft, saveMutation, saveState, tagsText, title]);
+  }, [getMobilePlainTextValue, mutateSave, persistCurrentDraft, saveMutationPending, saveState, tagsText, title]);
 
   useEffect(() => {
     markMobilePlainTextDirtyRef.current = markMobilePlainTextDirty;
@@ -2775,18 +2941,18 @@ const RichEditorPane = ({
       useMobilePlainTextEditor ||
       !editor ||
       !hasUnsavedChanges ||
-      saveMutation.isPending ||
+      saveMutationPending ||
       saveState === "conflict"
     ) {
       return;
     }
 
     const timer = window.setTimeout(() => {
-      saveMutation.mutate();
+      mutateSave();
     }, EDITOR_LOCAL_SAVE_DELAY_MS);
 
     return () => window.clearTimeout(timer);
-  }, [dirtyVersion, editor, hasUnsavedChanges, memo, saveMutation, saveState, useMobilePlainTextEditor]);
+  }, [dirtyVersion, editor, hasUnsavedChanges, memo, mutateSave, saveMutationPending, saveState, useMobilePlainTextEditor]);
 
   // Must stay above early returns so hook order never changes across loading/empty/editor states.
   const saveConflictReason = useMemo(
@@ -3424,7 +3590,7 @@ const RichEditorPane = ({
             </IconTooltip>
             {!readOnly && (
               <IconTooltip label={t("aiAssistant.open")}>
-                <Button className="hidden h-8 w-8 text-emerald-600 transition-colors hover:bg-emerald-50 hover:text-emerald-800 focus-visible:ring-2 focus-visible:ring-emerald-300 sm:inline-flex" size="icon" variant="ghost" aria-label={t("aiAssistant.open")} onClick={() => setAiAssistantOpen(true)}>
+                <Button className="hidden h-8 w-8 text-emerald-600 transition-colors hover:bg-emerald-50 hover:text-emerald-800 focus-visible:ring-2 focus-visible:ring-emerald-300 sm:inline-flex" size="icon" variant="ghost" aria-label={t("aiAssistant.open")} onClick={openAiAssistant}>
                   <Sparkles className="h-5 w-5" strokeWidth={2.25} />
                 </Button>
               </IconTooltip>
@@ -3504,7 +3670,7 @@ const RichEditorPane = ({
                 {!readOnly && (
                   <DropdownMenuItem
                     className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-emerald-700 hover:bg-emerald-50 cursor-pointer outline-none"
-                    onClick={() => setAiAssistantOpen(true)}
+                    onClick={openAiAssistant}
                   >
                     <Sparkles className="h-4 w-4 text-emerald-600" />
                     {t("aiAssistant.title")}
@@ -3560,6 +3726,13 @@ const RichEditorPane = ({
                 >
                   <FileDown className="h-4 w-4 text-slate-500" />
                   {t("editor.exportMarkdown")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
+                  onClick={() => void handleExportHtml()}
+                >
+                  <FileCode2 className="h-4 w-4 text-slate-500" />
+                  {t("editor.exportHtml")}
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
@@ -3958,6 +4131,25 @@ const RichEditorPane = ({
                 onFocusCapture={handleEditorFocusCapture}
                 onBlurCapture={handleEditorBlurCapture}
               >
+                <BubbleMenu
+                  editor={editor}
+                  shouldShow={({ editor: activeEditor }) =>
+                    activeEditor.isEditable && !activeEditor.state.selection.empty && !aiAssistantOpen
+                  }
+                  options={{ placement: "top" }}
+                >
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="solid"
+                    className="shadow-lg"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={openAiAssistant}
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                    {t("aiAssistant.openForSelection")}
+                  </Button>
+                </BubbleMenu>
                 <EditorContent editor={editor} />
               </div>
             )}
@@ -4211,8 +4403,10 @@ const RichEditorPane = ({
         open={aiAssistantOpen}
         title={title}
         contentMarkdown={getCurrentMarkdownForAi()}
-        onOpenChange={setAiAssistantOpen}
+        selectionMarkdown={aiSelection?.contentMarkdown}
+        onOpenChange={handleAiAssistantOpenChange}
         onApply={applyAiDraft}
+        onOpenPromptLibrary={onOpenAiPrompts}
       />
 
       <ShareMemoDialog memoId={memo.id} open={shareOpen} onOpenChange={setShareOpen} />

@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
+  buildLocalDevEnvironmentFile,
   findD1DatabaseIdByName,
   normalizeD1MigrationSql,
   runWranglerSync,
@@ -150,6 +151,10 @@ const isRemoteCommand =
   wranglerArgs.includes("deploy") || wranglerArgs.includes("--remote");
 const isRemoteDevCommand = wranglerArgs.includes("dev") && wranglerArgs.includes("--remote");
 const isLocalDevCommand = wranglerArgs.includes("dev") && wranglerArgs.includes("--local");
+// Any --local command rewrites .wrangler.generated.toml. Keep local-only vars
+// (especially auth-free access) so `d1 migrations apply --local` cannot strip
+// them and leave a later wrangler reload requiring login mid-session.
+const isLocalCommand = wranglerArgs.includes("--local");
 
 const workerName = envValue("WORKER_NAME");
 if (workerName) {
@@ -234,7 +239,7 @@ const runtimeVars = {
   EDGE_EVER_LOCAL_DEMO_SEED: envValue("LOCAL_DEMO_SEED"),
   // Auth-free access is a local-development capability. Remote deployments
   // fail closed when credentials and users are both missing.
-  EDGE_EVER_ALLOW_UNAUTHENTICATED: isLocalDevCommand ? "true" : undefined,
+  EDGE_EVER_ALLOW_UNAUTHENTICATED: isLocalCommand ? "true" : undefined,
 };
 const runtimeVarLines = Object.entries(runtimeVars)
   .filter(([, value]) => Boolean(value))
@@ -342,7 +347,7 @@ if (isDeployCommand && Object.keys(authSecrets).length === 0 && useExistingAuthS
 }
 
 if (isLocalDevCommand && !hasEnvFileArg) {
-  writeFileSync(generatedLocalDevEnvPath, "# Intentionally empty: local development must not inherit remote instance secrets.\n");
+  writeFileSync(generatedLocalDevEnvPath, buildLocalDevEnvironmentFile());
   finalWranglerArgs.push("--env-file", generatedLocalDevEnvPath);
 }
 
