@@ -251,6 +251,72 @@ body {
   overscroll-behavior-y: auto;
 }
 
+/* Installed theme packages only target this documented token layer. Keeping
+ * the selectors here lets themes survive component refactors without gaining
+ * arbitrary DOM or JavaScript access. */
+html[data-edgeever-extension-theme] {
+  --radius: var(--edgeever-theme-radius, 0.5rem);
+  font-family: var(--edgeever-theme-font-body, inherit);
+  font-size: var(--edgeever-theme-font-size, 100%);
+}
+
+html[data-edgeever-extension-theme] body {
+  background: var(--edgeever-theme-background, #f8fafc);
+  color: var(--edgeever-theme-text, #0f172a);
+  line-height: var(--edgeever-theme-line-height, normal);
+}
+
+html[data-edgeever-extension-theme] .bg-white,
+html[data-edgeever-extension-theme] .bg-slate-50,
+html[data-edgeever-extension-theme] .bg-slate-50\/50 {
+  background-color: var(--edgeever-theme-surface, #fff);
+}
+
+html[data-edgeever-extension-theme] .bg-slate-100,
+html[data-edgeever-extension-theme] .bg-slate-100\/80,
+html[data-edgeever-extension-theme] .bg-slate-200\/50 {
+  background-color: var(--edgeever-theme-surface-muted, #f1f5f9);
+}
+
+html[data-edgeever-extension-theme] .text-slate-700,
+html[data-edgeever-extension-theme] .text-slate-800,
+html[data-edgeever-extension-theme] .text-slate-900,
+html[data-edgeever-extension-theme] .text-slate-950 {
+  color: var(--edgeever-theme-text, #0f172a);
+}
+
+html[data-edgeever-extension-theme] .text-slate-400,
+html[data-edgeever-extension-theme] .text-slate-500,
+html[data-edgeever-extension-theme] .text-slate-600 {
+  color: var(--edgeever-theme-text-muted, #64748b);
+}
+
+html[data-edgeever-extension-theme] .border-slate-100,
+html[data-edgeever-extension-theme] .border-slate-200,
+html[data-edgeever-extension-theme] .border-slate-300,
+html[data-edgeever-extension-theme] .divide-slate-100 > :not([hidden]) ~ :not([hidden]),
+html[data-edgeever-extension-theme] .divide-slate-200 > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--edgeever-theme-border, #e2e8f0);
+}
+
+html[data-edgeever-extension-theme] .bg-emerald-600,
+html[data-edgeever-extension-theme] .bg-emerald-700 {
+  background-color: var(--edgeever-theme-accent, #16a06e);
+  color: var(--edgeever-theme-accent-foreground, #fff);
+}
+
+html[data-edgeever-extension-theme] .text-emerald-600,
+html[data-edgeever-extension-theme] .text-emerald-700,
+html[data-edgeever-extension-theme] .text-emerald-800 {
+  color: var(--edgeever-theme-accent, #16a06e);
+}
+
+html[data-edgeever-extension-theme] code,
+html[data-edgeever-extension-theme] pre,
+html[data-edgeever-extension-theme] kbd {
+  font-family: var(--edgeever-theme-font-mono, ui-monospace, monospace);
+}
+
 ::view-transition-old(root),
 ::view-transition-new(root) {
   animation-duration: 180ms;
@@ -387,6 +453,15 @@ textarea {
   line-height: var(--editor-body-line-height);
   margin: 0 0 var(--editor-paragraph-spacing);
   padding: 0;
+}
+
+/* Do not rely on the browser's relative `bolder` mapping here. Linux Chrome
+ * can render CJK fallback fonts with too little contrast between regular and
+ * bold, especially when the installed family has no matching bold face. */
+.ProseMirror strong,
+.ProseMirror b {
+  font-synthesis: weight;
+  font-weight: 800;
 }
 
 /* External hyperlinks (default theme).
@@ -534,13 +609,14 @@ textarea {
   padding-left: 0;
 }
 
-.ProseMirror ul[data-type="taskList"] li[data-type="taskItem"] {
+/* TipTap's task-item NodeView exposes data-checked, but not data-type, in the live editor DOM. */
+.ProseMirror ul[data-type="taskList"] li[data-checked] {
   display: flex;
   align-items: flex-start;
   gap: 0.55rem;
 }
 
-.ProseMirror ul[data-type="taskList"] li[data-type="taskItem"] > label {
+.ProseMirror ul[data-type="taskList"] li[data-checked] > label {
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
@@ -548,7 +624,7 @@ textarea {
   user-select: none;
 }
 
-.ProseMirror ul[data-type="taskList"] li[data-type="taskItem"] > label input {
+.ProseMirror ul[data-type="taskList"] li[data-checked] > label input {
   width: 1rem;
   height: 1rem;
   margin: 0;
@@ -556,12 +632,12 @@ textarea {
   cursor: pointer;
 }
 
-.ProseMirror ul[data-type="taskList"] li[data-type="taskItem"] > div {
+.ProseMirror ul[data-type="taskList"] li[data-checked] > div {
   min-width: 0;
   flex: 1 1 auto;
 }
 
-.ProseMirror ul[data-type="taskList"] li[data-type="taskItem"] > div > p {
+.ProseMirror ul[data-type="taskList"] li[data-checked] > div > p {
   margin-bottom: 0;
 }
 
@@ -649,6 +725,13 @@ textarea {
 .ProseMirror .edgeever-mermaid-code-block {
   overflow: visible;
   background: transparent;
+}
+
+@media (min-width: 1280px) {
+  .ProseMirror .edgeever-mermaid-code-block {
+    max-width: min(60vw, 52rem);
+    margin-inline: auto;
+  }
 }
 
 .ProseMirror .edgeever-mermaid-toolbar {
@@ -828,6 +911,61 @@ textarea {
   padding: 0.3rem;
   box-shadow: 0 10px 28px rgba(15, 23, 42, 0.16);
   line-height: 1;
+}
+
+.ProseMirror .edgeever-image-preview-control {
+  position: absolute;
+  right: 0.5rem;
+  top: 0.5rem;
+  z-index: 2;
+  border: 1px solid rgba(var(--brand-green-200-rgb), 0.95);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.94);
+  padding: 0.3rem;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.16);
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
+
+.ProseMirror .edgeever-image-node:hover .edgeever-image-preview-control,
+.ProseMirror .edgeever-image-preview-control:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.ProseMirror .edgeever-image-preview-button {
+  display: inline-flex;
+  width: 2rem;
+  height: 2rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  color: #475569;
+}
+
+.ProseMirror .edgeever-image-preview-button:hover,
+.ProseMirror .edgeever-image-preview-button:focus-visible {
+  background: var(--brand-green-muted);
+  color: var(--brand-green-text);
+}
+
+.ProseMirror .edgeever-image-preview-button:focus-visible {
+  outline: 2px solid var(--brand-green);
+  outline-offset: 2px;
+}
+
+.ProseMirror .edgeever-image-preview-button svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+@media (hover: none) {
+  .ProseMirror .edgeever-image-preview-control {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 .ProseMirror .edgeever-image-presets {

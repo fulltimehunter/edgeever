@@ -215,6 +215,7 @@ export const AiGenerateSchema = z.object({
   locale: z.string().trim().min(2).max(35).optional(),
   title: z.string().trim().max(160).default(""),
   contentMarkdown: z.string().max(300_000),
+  stream: z.boolean().default(false),
   targetLanguage: z.enum(AI_TARGET_LANGUAGES).optional(),
   tone: z.enum(AI_TONES).optional(),
   instruction: z.string().trim().min(1).max(2_000).optional(),
@@ -231,6 +232,25 @@ export const AiGenerateSchema = z.object({
   if (!input.title && !input.contentMarkdown.trim()) {
     context.addIssue({ code: "custom", path: ["contentMarkdown"], message: "Note content is required." });
   }
+});
+
+export const AiTagSuggestionsRequestSchema = z.object({
+  title: z.string().trim().max(160).default(""),
+  contentMarkdown: z.string().max(300_000),
+  currentTags: z.array(z.string().trim().min(1).max(200)).max(24).default([]),
+  locale: z.string().trim().min(2).max(35).optional(),
+}).superRefine((input, context) => {
+  if (!input.title && !input.contentMarkdown.trim()) {
+    context.addIssue({
+      code: "custom",
+      path: ["contentMarkdown"],
+      message: "Note content is required.",
+    });
+  }
+});
+
+export const AiTagSuggestionPromptUpdateSchema = z.object({
+  prompt: z.string().trim().min(1).max(4_000).nullable(),
 });
 
 export const AiPromptTemplateCreateSchema = z.object({
@@ -276,5 +296,7 @@ export type AiProviderConnectionTestInput = z.infer<typeof AiProviderConnectionT
 export type AiModelConfigCreateInput = z.infer<typeof AiModelConfigCreateSchema>;
 export type AiDefaultModelUpdateInput = z.infer<typeof AiDefaultModelUpdateSchema>;
 export type AiGenerateInput = z.infer<typeof AiGenerateSchema>;
+export type AiTagSuggestionsRequestInput = z.infer<typeof AiTagSuggestionsRequestSchema>;
+export type AiTagSuggestionPromptUpdateInput = z.infer<typeof AiTagSuggestionPromptUpdateSchema>;
 export type AiPromptTemplateCreateInput = z.input<typeof AiPromptTemplateCreateSchema>;
 export type AiPromptTemplateUpdateInput = z.infer<typeof AiPromptTemplateUpdateSchema>;

@@ -61,7 +61,7 @@ export const AiAssistantDialog = ({
   contentMarkdown: string;
   selectionMarkdown?: string | null;
   onOpenChange: (open: boolean) => void;
-  onApply: (text: string, mode: "append" | "replace") => void;
+  onApply: (text: string, mode: "append" | "replace") => boolean;
   onOpenPromptLibrary?: () => void;
 }) => {
   const { t, i18n } = useTranslation();
@@ -245,6 +245,13 @@ export const AiAssistantDialog = ({
     return generate();
   };
 
+  const applyOutput = (mode: "append" | "replace") => {
+    setError(null);
+    if (!onApply(output, mode)) {
+      setError(t("aiAssistant.applyFailed"));
+    }
+  };
+
   const copy = async () => {
     if (await copyTextToClipboard(output)) {
       setCopied(true);
@@ -326,9 +333,9 @@ export const AiAssistantDialog = ({
                   </button>
                 ) : null}
               </div>
-              <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+              <div className="grid min-w-0 grid-cols-1 gap-2 sm:grid-cols-3">
                 <Select value={selectValue} onValueChange={handleActionChange}>
-                  <SelectTrigger aria-label={t("aiAssistant.actionLabel")} className="h-10 w-full min-w-0 sm:w-60 sm:shrink-0">
+                  <SelectTrigger aria-label={t("aiAssistant.actionLabel")} className="h-10 w-full min-w-0 sm:col-span-2">
                     <SelectValue placeholder={t("aiAssistant.actionLabel")} />
                   </SelectTrigger>
                   <SelectContent>
@@ -347,22 +354,22 @@ export const AiAssistantDialog = ({
                     </SelectGroup>
                   </SelectContent>
                 </Select>
-                <div className="flex min-w-0 gap-2">
+                <div className="grid min-w-0 grid-cols-2 gap-2">
                   <Button
                     type="button"
                     variant={!selectedPromptId && action === "custom" ? "solid" : "outline"}
-                    className="h-10 min-w-0 flex-1 gap-1 px-2 text-xs font-normal text-slate-600 sm:h-8 sm:flex-none sm:shrink-0"
+                    className="h-10 min-w-0 w-full gap-1 px-2 text-xs font-normal text-slate-600"
                     onClick={() => handleActionChange(FREEFORM_VALUE)}
                   >
                     <PenLine className="h-3.5 w-3.5" />
                     {t("aiAssistant.useCustom")}
                   </Button>
                   {isGenerating ? (
-                    <Button type="button" variant="solid" className="h-10 min-w-[7.5rem] flex-1 shrink-0 gap-1.5 px-3 text-sm font-semibold sm:w-[7.5rem] sm:flex-none sm:px-0" onClick={() => controllerRef.current?.abort()}>
+                    <Button type="button" variant="solid" className="h-10 min-w-0 w-full gap-1.5 px-2 text-sm font-semibold" onClick={() => controllerRef.current?.abort()}>
                       <Square className="h-3.5 w-3.5" />{t("aiAssistant.stop")}
                     </Button>
                   ) : (
-                    <Button type="button" variant="solid" className="h-10 min-w-[7.5rem] flex-1 shrink-0 gap-1.5 px-3 text-sm font-semibold sm:w-[7.5rem] sm:flex-none sm:px-0" disabled={generateDisabled} onClick={() => void generate()}>
+                    <Button type="button" variant="solid" className="h-10 min-w-0 w-full gap-1.5 px-2 text-sm font-semibold" disabled={generateDisabled} onClick={() => void generate()}>
                       <Sparkles className="h-4 w-4" />{t("aiAssistant.generate")}
                     </Button>
                   )}
@@ -488,12 +495,12 @@ export const AiAssistantDialog = ({
               </div>
               <div className="flex flex-wrap gap-2">
                 {promptAllowsReplace(effectiveResultMode) ? (
-                  <Button type="button" variant={hasSelection ? "solid" : "outline"} disabled={isGenerating} onClick={() => onApply(output, "replace")}>
+                  <Button type="button" variant={hasSelection ? "solid" : "outline"} disabled={isGenerating} onClick={() => applyOutput("replace")}>
                     {t(hasSelection ? "aiAssistant.replaceSelection" : "aiAssistant.replace")}
                   </Button>
                 ) : null}
                 {promptAllowsAppend(effectiveResultMode) ? (
-                  <Button type="button" variant={hasSelection && promptAllowsReplace(effectiveResultMode) ? "outline" : "solid"} disabled={isGenerating} onClick={() => onApply(output, "append")}>{t("aiAssistant.append")}</Button>
+                  <Button type="button" variant={hasSelection && promptAllowsReplace(effectiveResultMode) ? "outline" : "solid"} disabled={isGenerating} onClick={() => applyOutput("append")}>{t("aiAssistant.append")}</Button>
                 ) : null}
               </div>
             </DialogFooter>

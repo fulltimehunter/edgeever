@@ -11,6 +11,10 @@ import {
   isSuspiciousMemoOverwrite,
   isMemoEditBindingValid,
   normalizeTags,
+  AiPromptTemplateCreateSchema,
+  AiPromptTemplateUpdateSchema,
+  TemplateCreateSchema,
+  TemplateUpdateSchema,
   type MemoDetail,
   type MemoEditSession,
   type MemoRevision,
@@ -26,6 +30,7 @@ import { Hono } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
 import { cors } from "hono/cors";
 import openApiSpec from "../../../docs/openapi.json";
+import releaseSummary from "../../../release-summary.json";
 import { hasBootstrapCredential, isSupportedPasswordHash, verifyBootstrapPassword } from "./auth-bootstrap";
 import {
   isDatabaseNotReadyError,
@@ -81,6 +86,10 @@ import {
 import { audit, auditStatement } from "./audit";
 import { createId, isoNow, parseJsonArray } from "./entity-utils";
 import {
+  deleteMemoSearchDocumentsStatement,
+  upsertMemoSearchDocumentStatement,
+} from "./memo-search-index";
+import {
   createNotebookRecord,
   findNotebooks,
   getNotebook,
@@ -109,14 +118,20 @@ import {
   type TokenScope,
 } from "./request-auth";
 import { registerTagRoutes } from "./tag-routes";
-import { registerTemplateRoutes } from "./template-routes";
+import { getMemoTemplate, listMemoTemplates, registerTemplateRoutes } from "./template-routes";
 import { registerAuthRoutes, type UserRow } from "./auth-routes";
 import { registerApiTokenRoutes, type ApiTokenRow } from "./api-token-routes";
 import { registerObjectStorageRoutes } from "./object-storage-routes";
 import { registerAiRoutes } from "./ai-routes";
 import { registerAiPromptRoutes } from "./ai-prompt-routes";
-import { ensureWorkspaceAiPromptSeed } from "./ai-prompt-seed";
+import {
+  getAiPromptTemplateRow,
+  listAiPromptTemplates,
+  mapAiPromptTemplateRow,
+} from "./ai-prompt-service";
+import { restoreMissingDefaultAiPrompts } from "./ai-prompt-seed";
 import { registerResourceRoutes } from "./resource-routes";
+import { registerPluginDistributionRoutes } from "./plugin-distribution-routes";
 import { registerSyncRoutes } from "./sync-routes";
 import { registerMemoRoutes } from "./memo-routes";
 import { registerBackupRoutes } from "./backup-routes";
@@ -138,6 +153,10 @@ import {
   deleteStoredObjects,
   resolveObjectStorage,
 } from "./object-storage";
+import {
+  DEFAULT_WORKSPACE_ID,
+  ensureUserWorkspace,
+} from "./workspace-provisioning";
 import {
   MAX_ATTACHMENT_UPLOAD_BYTES,
   MAX_IMAGE_UPLOAD_BYTES,
@@ -200,6 +219,9 @@ type SessionRow = {
   username: string;
   display_name: string | null;
   expires_at: string;
+  last_seen_at: string | null;
+  workspace_id: string | null;
+  role: "owner" | "member" | null;
 };
 
 type WorkspaceIdentityRow = {
@@ -219,9 +241,12 @@ type MemoImportSourceRow = {
 };
 
 const SESSION_COOKIE = "edgeever_session";
-const DEFAULT_WORKSPACE_ID = "ws_default";
 const DEFAULT_SESSION_TTL_DAYS = 400;
 const MAX_SESSION_TTL_DAYS = 400;
+const SESSION_LAST_SEEN_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
+const API_TOKEN_LAST_USED_UPDATE_INTERVAL_MS = 60 * 60 * 1000;
+const DEMO_RESET_LEASE_MS = 5 * 60 * 1000;
+const DEMO_RESET_COOLDOWN_MS = 60 * 1000;
 const DEFAULT_R2_BUCKET_NAME = "edgeever-resources";
 const REVISION_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
 const app = new Hono<AppEnv>();
@@ -246,11 +271,25 @@ app.use(
   })
 );
 
+app.get("/api/release", (c) => c.json(releaseSummary));
+
 app.get("/api/health", async (c) => {
-  const authMode = await getInstanceAuthMode(c.env);
+  const authMode = await getInstanceAuthMode(c.env, true);
 
   if (authMode === "unconfigured") {
     return authNotConfigured(c);
+  }
+
+  if (!c.env.storage.resources) {
+    return c.json(
+      {
+        error: {
+          code: "object_storage_not_ready",
+          message: "Object storage is not configured. Bind RESOURCES and redeploy.",
+        },
+      },
+      503,
+    );
   }
 
   return c.json({
@@ -282,7 +321,6 @@ registerAuthRoutes(app, {
 });
 registerUserRoutes(app, {
   authenticateRequest: (...args) => authenticateRequest(...args),
-  createDefaultNotebookRows: (...args) => createDefaultNotebookRows(...args),
   getInstanceUser: (...args) => getInstanceUser(...args),
 });
 
@@ -345,6 +383,7 @@ registerSyncRoutes(app, {
   mapMemoDetail: (...args) => mapMemoDetail(...args),
 });
 registerTagRoutes(app);
+registerPluginDistributionRoutes(app);
 registerMemoShareRoutes(app);
 registerTemplateRoutes(app, {
   createMemoRecord: (...args) => createMemoRecord(...args),
@@ -565,18 +604,29 @@ app.post("/api/v1/demo/reset", async (c) => {
   });
 });
 
-const worker = {
-  async fetch(request: Request, env: WorkerBindings, ctx: ExecutionContext) {
-    const runtimeEnv = {
-      ...env,
-      storage: createCloudflareStorageAdapter(env),
-    } as Bindings;
-
+/**
+ * Executes the platform-neutral EdgeEver application with an injected storage
+ * adapter. Runtime entrypoints must remain thin and call this function rather
+ * than introducing platform-specific route or service implementations.
+ */
+export const fetchEdgeEverApp = async (
+  request: Request,
+  runtimeEnv: Bindings,
+  ctx: ExecutionContext,
+) => {
     if (isLocalDemoSeedEnabled(runtimeEnv)) {
       await ensureLocalDemoSeed(runtimeEnv);
     }
 
     return app.fetch(request, runtimeEnv, ctx);
+};
+
+const worker = {
+  async fetch(request: Request, env: WorkerBindings, ctx: ExecutionContext) {
+    return fetchEdgeEverApp(request, {
+      ...env,
+      storage: createCloudflareStorageAdapter(env),
+    }, ctx);
   },
   async scheduled(controller: ScheduledController, env: WorkerBindings, ctx: ExecutionContext) {
     const runtimeEnv = {
@@ -620,7 +670,28 @@ app.onError((error, c) => {
 
 export default worker;
 
-const callMcpTool = async (
+type McpInputSchema<T> = {
+  safeParse: (input: unknown) =>
+    | { success: true; data: T }
+    | { success: false; error: { issues: Array<{ path: PropertyKey[]; message: string }> } };
+};
+
+const parseMcpInput = <T>(schema: McpInputSchema<T>, input: unknown): T => {
+  const result = schema.safeParse(input);
+  if (result.success) return result.data;
+  const message = result.error.issues
+    .map((issue) => `${issue.path.join(".") || "arguments"}: ${issue.message}`)
+    .join("; ");
+  throw new AppError("invalid_params", message, 400);
+};
+
+const assertMcpMutationAllowed = (environment: Bindings) => {
+  if (isDemoMode(environment)) {
+    throw new AppError("forbidden", "Templates and AI instructions cannot be changed in demo mode.", 403);
+  }
+};
+
+export const callMcpTool = async (
   c: AppContext,
   auth: AuthContext,
   name: string,
@@ -1025,18 +1096,266 @@ const callMcpTool = async (
       assertScope(auth, "read:memos");
       return await getWorkspaceStats(c.env.storage.db, auth.workspaceId);
     }
+    case "list_note_templates": {
+      assertScope(auth, "read:memos");
+      return { templates: await listMemoTemplates(c.env.storage.db, auth.workspaceId) };
+    }
+    case "get_note_template": {
+      assertScope(auth, "read:memos");
+      const template = await getMemoTemplate(
+        c.env.storage.db,
+        auth.workspaceId,
+        getRequiredString(args.templateId, "templateId"),
+      );
+      if (!template) throw new AppError("not_found", "Template not found", 404);
+      return { template };
+    }
+    case "create_note_template": {
+      assertScope(auth, "write:memos");
+      assertMcpMutationAllowed(c.env);
+      const input = parseMcpInput(TemplateCreateSchema, args);
+      const memo = input.memoId
+        ? await getMemoDetail(c.env.storage.db, auth.workspaceId, input.memoId)
+        : null;
+      if (input.memoId && !memo) throw new AppError("not_found", "Memo not found", 404);
+
+      const id = createId("template");
+      const now = isoNow();
+      const title = memo?.title ?? (input.title?.trim() || null);
+      const contentMarkdown = memo?.contentMarkdown ?? input.contentMarkdown ?? "";
+      const tags = memo?.tags ?? input.tags ?? [];
+      const contentJson = memo?.contentJson ?? markdownToDoc(contentMarkdown);
+      await c.env.storage.db.prepare(
+        `INSERT INTO memo_templates (
+           id, workspace_id, name, description, title, content_json, content_markdown, tags_json, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        id,
+        auth.workspaceId,
+        input.name.trim(),
+        input.description?.trim() || null,
+        title,
+        JSON.stringify(contentJson),
+        contentMarkdown,
+        JSON.stringify(tags),
+        now,
+        now,
+      ).run();
+      const actor = getAuditActor(c);
+      await audit(c.env.storage.db, actor.actorType, actor.actorId, "template.create", "template", id, {
+        memoId: input.memoId ?? null,
+      });
+      return { template: await getMemoTemplate(c.env.storage.db, auth.workspaceId, id) };
+    }
+    case "update_note_template": {
+      assertScope(auth, "write:memos");
+      assertMcpMutationAllowed(c.env);
+      const templateId = getRequiredString(args.templateId, "templateId");
+      const input = parseMcpInput(TemplateUpdateSchema, args);
+      if (Object.keys(input).length === 0) {
+        throw new AppError("invalid_params", "At least one template field is required.", 400);
+      }
+      const current = await getMemoTemplate(c.env.storage.db, auth.workspaceId, templateId);
+      if (!current) throw new AppError("not_found", "Template not found", 404);
+
+      const contentMarkdown = input.contentMarkdown ?? current.contentMarkdown;
+      const contentJson = input.contentMarkdown !== undefined
+        ? markdownToDoc(contentMarkdown)
+        : current.contentJson;
+      const now = isoNow();
+      await c.env.storage.db.prepare(
+        `UPDATE memo_templates
+         SET name = ?, description = ?, title = ?, content_json = ?, content_markdown = ?, tags_json = ?, updated_at = ?
+         WHERE id = ? AND workspace_id = ?`,
+      ).bind(
+        input.name ?? current.name,
+        input.description !== undefined ? input.description?.trim() || null : current.description,
+        input.title !== undefined ? input.title?.trim() || null : current.title,
+        JSON.stringify(contentJson),
+        contentMarkdown,
+        JSON.stringify(input.tags ?? current.tags),
+        now,
+        templateId,
+        auth.workspaceId,
+      ).run();
+      const actor = getAuditActor(c);
+      await audit(c.env.storage.db, actor.actorType, actor.actorId, "template.update", "template", templateId, {});
+      return { template: await getMemoTemplate(c.env.storage.db, auth.workspaceId, templateId) };
+    }
+    case "delete_note_template": {
+      assertScope(auth, "write:memos");
+      assertMcpMutationAllowed(c.env);
+      const templateId = getRequiredString(args.templateId, "templateId");
+      const current = await getMemoTemplate(c.env.storage.db, auth.workspaceId, templateId);
+      if (!current) throw new AppError("not_found", "Template not found", 404);
+      await c.env.storage.db.prepare(
+        `DELETE FROM memo_templates WHERE id = ? AND workspace_id = ?`,
+      ).bind(templateId, auth.workspaceId).run();
+      const actor = getAuditActor(c);
+      await audit(c.env.storage.db, actor.actorType, actor.actorId, "template.delete", "template", templateId, {});
+      return { ok: true };
+    }
+    case "use_note_template": {
+      assertScope(auth, "write:memos");
+      assertMcpMutationAllowed(c.env);
+      const templateId = getRequiredString(args.templateId, "templateId");
+      const template = await getMemoTemplate(c.env.storage.db, auth.workspaceId, templateId);
+      if (!template) throw new AppError("not_found", "Template not found", 404);
+      const memo = await createMemoRecord(c.env.storage.db, auth.workspaceId, {
+        notebookId: getRequiredString(args.notebookId, "notebookId"),
+        title: template.title ?? undefined,
+        contentMarkdown: template.contentMarkdown,
+        tags: template.tags,
+      }, getAuditActor(c), getActorLabel(c));
+      const actor = getAuditActor(c);
+      await audit(c.env.storage.db, actor.actorType, actor.actorId, "template.use", "template", templateId, { memoId: memo.id });
+      return { memo };
+    }
+    case "list_ai_instructions": {
+      assertScope(auth, "read:memos");
+      return {
+        instructions: await listAiPromptTemplates(
+          c.env.storage.db,
+          auth.workspaceId,
+          getOptionalString(args.locale),
+        ),
+      };
+    }
+    case "get_ai_instruction": {
+      assertScope(auth, "read:memos");
+      const row = await getAiPromptTemplateRow(
+        c.env.storage.db,
+        auth.workspaceId,
+        getRequiredString(args.instructionId, "instructionId"),
+      );
+      if (!row) throw new AppError("not_found", "AI instruction not found", 404);
+      return { instruction: mapAiPromptTemplateRow(row, getOptionalString(args.locale)) };
+    }
+    case "create_ai_instruction": {
+      assertScope(auth, "write:memos");
+      assertMcpMutationAllowed(c.env);
+      const input = parseMcpInput(AiPromptTemplateCreateSchema, args);
+      const id = createId("aiprompt");
+      const now = isoNow();
+      const actor = getAuditActor(c);
+      await c.env.storage.db.batch([
+        c.env.storage.db.prepare(
+          `INSERT INTO ai_prompt_templates (
+             id, workspace_id, seed_key, action, parameter_kind, result_mode,
+             name, description, instruction,
+             name_customized, description_customized, instruction_customized,
+             created_at, updated_at
+           ) VALUES (?, ?, NULL, 'custom', ?, ?, ?, ?, ?, 1, 1, 1, ?, ?)`,
+        ).bind(
+          id,
+          auth.workspaceId,
+          input.parameterKind,
+          input.resultMode,
+          input.name.trim(),
+          input.description?.trim() || null,
+          input.instruction.trim(),
+          now,
+          now,
+        ),
+        auditStatement(c.env.storage.db, actor.actorType, actor.actorId, "ai_prompt.create", "ai_prompt", id, {}),
+      ]);
+      const row = await getAiPromptTemplateRow(c.env.storage.db, auth.workspaceId, id);
+      return { instruction: mapAiPromptTemplateRow(row!, getOptionalString(args.locale)) };
+    }
+    case "update_ai_instruction": {
+      assertScope(auth, "write:memos");
+      assertMcpMutationAllowed(c.env);
+      const instructionId = getRequiredString(args.instructionId, "instructionId");
+      const input = parseMcpInput(AiPromptTemplateUpdateSchema, args);
+      const current = await getAiPromptTemplateRow(c.env.storage.db, auth.workspaceId, instructionId);
+      if (!current) throw new AppError("not_found", "AI instruction not found", 404);
+
+      const now = isoNow();
+      const actor = getAuditActor(c);
+      await c.env.storage.db.batch([
+        c.env.storage.db.prepare(
+          `UPDATE ai_prompt_templates
+           SET name = ?, description = ?, instruction = ?,
+               parameter_kind = ?, result_mode = ?,
+               name_customized = ?, description_customized = ?, instruction_customized = ?,
+               updated_at = ?
+           WHERE id = ? AND workspace_id = ?`,
+        ).bind(
+          input.name?.trim() ?? current.name,
+          input.description !== undefined ? input.description?.trim() || null : current.description,
+          input.instruction?.trim() ?? current.instruction,
+          input.parameterKind ?? current.parameter_kind,
+          input.resultMode ?? current.result_mode,
+          input.name !== undefined ? 1 : current.name_customized,
+          input.description !== undefined ? 1 : current.description_customized,
+          input.instruction !== undefined ? 1 : current.instruction_customized,
+          now,
+          instructionId,
+          auth.workspaceId,
+        ),
+        auditStatement(c.env.storage.db, actor.actorType, actor.actorId, "ai_prompt.update", "ai_prompt", instructionId, {}),
+      ]);
+      const row = await getAiPromptTemplateRow(c.env.storage.db, auth.workspaceId, instructionId);
+      return { instruction: mapAiPromptTemplateRow(row!, getOptionalString(args.locale)) };
+    }
+    case "delete_ai_instruction": {
+      assertScope(auth, "write:memos");
+      assertMcpMutationAllowed(c.env);
+      const instructionId = getRequiredString(args.instructionId, "instructionId");
+      const current = await getAiPromptTemplateRow(c.env.storage.db, auth.workspaceId, instructionId);
+      if (!current) throw new AppError("not_found", "AI instruction not found", 404);
+      const actor = getAuditActor(c);
+      await c.env.storage.db.batch([
+        c.env.storage.db.prepare(
+          `DELETE FROM ai_prompt_templates WHERE id = ? AND workspace_id = ?`,
+        ).bind(instructionId, auth.workspaceId),
+        auditStatement(c.env.storage.db, actor.actorType, actor.actorId, "ai_prompt.delete", "ai_prompt", instructionId, {}),
+      ]);
+      return { ok: true };
+    }
+    case "restore_default_ai_instructions": {
+      assertScope(auth, "write:memos");
+      assertMcpMutationAllowed(c.env);
+      const result = await restoreMissingDefaultAiPrompts(c.env.storage.db, auth.workspaceId);
+      if (result.restoredCount > 0) {
+        const actor = getAuditActor(c);
+        await audit(c.env.storage.db, actor.actorType, actor.actorId, "ai_prompt.restore_defaults", "workspace", auth.workspaceId, result);
+      }
+      return {
+        ...result,
+        instructions: await listAiPromptTemplates(
+          c.env.storage.db,
+          auth.workspaceId,
+          getOptionalString(args.locale),
+        ),
+      };
+    }
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
 };
 
-const getInstanceAuthMode = async (env: Bindings): Promise<InstanceAuthMode> => {
+const getInstanceAuthMode = async (
+  env: Bindings,
+  verifyDatabase = false,
+): Promise<InstanceAuthMode> => {
   if (!env.storage.db || typeof env.storage.db.prepare !== "function") {
     throw new AppError(
       "database_not_ready",
       "Database is not ready. Bind the D1 database as DB and apply the remote migrations.",
       503,
     );
+  }
+
+  const allowUnauthenticated = isUnauthenticatedAccessEnabled(env.EDGE_EVER_ALLOW_UNAUTHENTICATED);
+  const bootstrapCredentialConfigured = hasBootstrapCredential(
+    env.EDGE_EVER_AUTH_PASSWORD,
+    env.EDGE_EVER_AUTH_PASSWORD_HASH,
+  );
+
+  if (!verifyDatabase) {
+    if (allowUnauthenticated) return "disabled";
+    if (bootstrapCredentialConfigured) return "required";
   }
 
   let user: { id: string } | null;
@@ -1054,11 +1373,8 @@ const getInstanceAuthMode = async (env: Bindings): Promise<InstanceAuthMode> => 
   }
 
   return resolveInstanceAuthMode({
-    allowUnauthenticated: isUnauthenticatedAccessEnabled(env.EDGE_EVER_ALLOW_UNAUTHENTICATED),
-    hasBootstrapCredential: hasBootstrapCredential(
-      env.EDGE_EVER_AUTH_PASSWORD,
-      env.EDGE_EVER_AUTH_PASSWORD_HASH,
-    ),
+    allowUnauthenticated,
+    hasBootstrapCredential: bootstrapCredentialConfigured,
     hasEnabledUser: Boolean(user),
   });
 };
@@ -1167,85 +1483,6 @@ const getInstanceUser = (db: D1Database, userId: string) =>
      WHERE u.id = ?`
   ).bind(userId).first<InstanceUserRow>();
 
-const ensureUserWorkspace = async (db: D1Database, userId: string, username: string) => {
-  const existing = await db.prepare(
-    `SELECT workspace_id, role FROM workspace_members WHERE user_id = ? LIMIT 1`
-  ).bind(userId).first<{ workspace_id: string; role: "owner" | "member" }>();
-  if (existing) {
-    await ensureWorkspaceTemplateSeed(db, existing.workspace_id);
-    await ensureWorkspaceAiPromptSeed(db, existing.workspace_id);
-    return { workspaceId: existing.workspace_id, role: existing.role };
-  }
-
-  const defaultOwner = await db.prepare(
-    `SELECT user_id FROM workspace_members WHERE workspace_id = ? LIMIT 1`
-  ).bind(DEFAULT_WORKSPACE_ID).first<{ user_id: string }>();
-  if (!defaultOwner) {
-    await db.prepare(
-      `INSERT OR IGNORE INTO workspace_members (workspace_id, user_id, role) VALUES (?, ?, 'owner')`
-    ).bind(DEFAULT_WORKSPACE_ID, userId).run();
-    const claimed = await db.prepare(
-      `SELECT workspace_id, role FROM workspace_members WHERE user_id = ? LIMIT 1`
-    ).bind(userId).first<{ workspace_id: string; role: "owner" | "member" }>();
-    if (claimed) {
-      await ensureWorkspaceTemplateSeed(db, claimed.workspace_id);
-      await ensureWorkspaceAiPromptSeed(db, claimed.workspace_id);
-      return { workspaceId: claimed.workspace_id, role: claimed.role };
-    }
-  }
-
-  const workspaceId = createId("ws");
-  const now = isoNow();
-  const notebooks = createDefaultNotebookRows(workspaceId, now);
-  await db.batch([
-    db.prepare(`INSERT INTO workspaces (id, name, is_personal, created_at, updated_at) VALUES (?, ?, 1, ?, ?)`)
-      .bind(workspaceId, `${username}'s workspace`, now, now),
-    db.prepare(`INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'member', ?)`)
-      .bind(workspaceId, userId, now),
-    ...notebooks.map((notebook) => db.prepare(
-      `INSERT INTO notebooks (id, workspace_id, parent_id, name, slug, icon, color, sort_order, created_at, updated_at)
-       VALUES (?, ?, NULL, ?, ?, 'notebook', ?, ?, ?, ?)`
-    ).bind(notebook.id, workspaceId, notebook.name, notebook.slug, notebook.color, notebook.sortOrder, now, now)),
-  ]);
-  await ensureWorkspaceTemplateSeed(db, workspaceId);
-  await ensureWorkspaceAiPromptSeed(db, workspaceId);
-  return { workspaceId, role: "member" as const };
-};
-
-const createDefaultNotebookRows = (workspaceId: string, _now: string) => [
-  { id: `${workspaceId}_inbox`, name: "等待分类", slug: "inbox", color: "#0f766e", sortOrder: 10 },
-  { id: `${workspaceId}_projects`, name: "工作项目", slug: "work-projects", color: "#2563eb", sortOrder: 20 },
-  { id: `${workspaceId}_learning`, name: "学习资料", slug: "learning-resources", color: "#7c3aed", sortOrder: 30 },
-  { id: `${workspaceId}_creative`, name: "灵感创作", slug: "creative-ideas", color: "#db2777", sortOrder: 40 },
-  { id: `${workspaceId}_personal`, name: "生活个人", slug: "personal-life", color: "#ea580c", sortOrder: 50 },
-];
-
-const ensureWorkspaceTemplateSeed = async (db: D1Database, workspaceId: string) => {
-  const now = isoNow();
-  const templateId = `${workspaceId}_template_project_weekly`;
-  const contentMarkdown = "## 本周进展\n\n- \n\n## 关键成果\n\n- \n\n## 风险与阻塞\n\n- \n\n## 下周计划\n\n- [ ] \n\n## 需要协助\n\n- ";
-  const contentJson = markdownToDoc(contentMarkdown);
-
-  await db.prepare(
-    `INSERT OR IGNORE INTO memo_templates (
-       id, workspace_id, name, description, title, content_json, content_markdown, tags_json, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(
-    templateId,
-    workspaceId,
-    "项目周报模板",
-    "每周同步项目进展、风险与下一步计划",
-    "项目周报｜第 {{周次}} 周",
-    JSON.stringify(contentJson),
-    contentMarkdown,
-    JSON.stringify(["项目管理", "周报"]),
-    now,
-    now,
-  ).run();
-};
-
-
-
 const createSession = async (c: AppContext, user: UserRow, requestedDeviceId?: string) => {
   const token = randomToken(SESSION_TOKEN_BYTES);
   const id = createId("sess");
@@ -1329,8 +1566,18 @@ const authenticateBearerToken = async (c: AppContext, touch: boolean): Promise<A
     return null;
   }
 
-  if (touch) {
-    await c.env.storage.db.prepare(`UPDATE api_tokens SET last_used_at = ? WHERE id = ?`).bind(isoNow(), row.id).run();
+  const lastUsedAt = row.last_used_at ? Date.parse(row.last_used_at) : Number.NaN;
+  if (
+    touch
+    && (!Number.isFinite(lastUsedAt) || lastUsedAt <= Date.now() - API_TOKEN_LAST_USED_UPDATE_INTERVAL_MS)
+  ) {
+    const now = isoNow();
+    const cutoff = new Date(Date.now() - API_TOKEN_LAST_USED_UPDATE_INTERVAL_MS).toISOString();
+    await c.env.storage.db.prepare(
+      `UPDATE api_tokens
+       SET last_used_at = ?
+       WHERE id = ? AND (last_used_at IS NULL OR last_used_at <= ?)`,
+    ).bind(now, row.id, cutoff).run();
   }
 
   return {
@@ -1347,27 +1594,41 @@ const authenticateBearerToken = async (c: AppContext, touch: boolean): Promise<A
 };
 
 const authenticateSessionToken = async (c: AppContext, token: string, touch: boolean): Promise<AuthContext | null> => {
+  const now = isoNow();
   const row = await c.env.storage.db.prepare(
-    `SELECT s.id, s.user_id, u.username, u.display_name, s.expires_at
+    `SELECT s.id, s.user_id, u.username, u.display_name, s.expires_at, s.last_seen_at,
+            wm.workspace_id, wm.role
      FROM sessions s
      INNER JOIN users u ON u.id = s.user_id
+     LEFT JOIN workspace_members wm ON wm.user_id = s.user_id
      WHERE s.token_hash = ?
        AND s.revoked_at IS NULL
        AND s.expires_at > ?
        AND u.is_disabled = 0`
   )
-    .bind(await sha256(token), isoNow())
+    .bind(await sha256(token), now)
     .first<SessionRow>();
 
   if (!row) {
     return null;
   }
 
-  if (touch) {
-    await c.env.storage.db.prepare(`UPDATE sessions SET last_seen_at = ? WHERE id = ?`).bind(isoNow(), row.id).run();
+  const lastSeenAt = row.last_seen_at ? Date.parse(row.last_seen_at) : Number.NaN;
+  if (
+    touch
+    && (!Number.isFinite(lastSeenAt) || lastSeenAt <= Date.now() - SESSION_LAST_SEEN_UPDATE_INTERVAL_MS)
+  ) {
+    const cutoff = new Date(Date.now() - SESSION_LAST_SEEN_UPDATE_INTERVAL_MS).toISOString();
+    await c.env.storage.db.prepare(
+      `UPDATE sessions
+       SET last_seen_at = ?
+       WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at <= ?)`,
+    ).bind(now, row.id, cutoff).run();
   }
 
-  const workspace = await ensureUserWorkspace(c.env.storage.db, row.user_id, row.username);
+  const workspace = row.workspace_id && row.role
+    ? { workspaceId: row.workspace_id, role: row.role }
+    : await ensureUserWorkspace(c.env.storage.db, row.user_id, row.username, c.req.header("accept-language"));
 
   return {
     kind: "user",
@@ -1543,10 +1804,7 @@ const restoreJsonMemos = async (db: D1Database, workspaceId: string, backups: Js
         memo.createdAt,
         memo.updatedAt
       ),
-      db.prepare(`DELETE FROM memos_fts WHERE memo_id = ?`).bind(memo.id),
-      db.prepare(
-        `INSERT INTO memos_fts (memo_id, title, content_text, tags) VALUES (?, ?, ?, ?)`
-      ).bind(memo.id, title, contentText, tags.join(" ")),
+      upsertMemoSearchDocumentStatement(db, memo.id, title, contentText, tags.join(" ")),
       db.prepare(`DELETE FROM memo_revisions WHERE memo_id = ?`).bind(memo.id),
     ]);
 
@@ -1691,8 +1949,8 @@ const searchMemoSummaries = async (
   }
 
   for (const tag of tags) {
-    filters.push("EXISTS (SELECT 1 FROM json_each(m.tags_json) WHERE json_each.value = ?)");
-    binds.push(tag);
+    filters.push("EXISTS (SELECT 1 FROM memo_tags mt WHERE mt.memo_id = m.id AND mt.workspace_id = ? AND mt.name = ?)");
+    binds.push(options.workspaceId, tag);
   }
 
   if (options.createdAfter) {
@@ -1874,12 +2132,44 @@ const getMemoDetail = async (db: D1Database, workspaceId: string, id: string, in
   return row ? mapMemoDetail(row) : null;
 };
 
-const createMemoEditSession = async (c: AppContext, memoId: string): Promise<MemoEditSession | null> => {
+export const createMemoEditSession = async (c: AppContext, memoId: string): Promise<MemoEditSession | null> => {
   const current = await getMemoDetailRow(c.env.storage.db, getWorkspaceId(c), memoId);
   if (!current) return null;
 
   const actor = getAuditActor(c);
   const now = isoNow();
+  const existing = await c.env.storage.db.prepare(
+    `SELECT id, memo_id, base_revision, base_content_hash, expires_at
+     FROM memo_edit_sessions
+     WHERE memo_id = ? AND actor_type = ? AND actor_id IS ?
+       AND base_revision = ? AND base_content_hash = ? AND expires_at > ?
+     ORDER BY updated_at DESC
+     LIMIT 1`,
+  ).bind(
+    memoId,
+    actor.actorType,
+    actor.actorId,
+    current.revision,
+    current.content_hash,
+    now,
+  ).first<{
+    id: string;
+    memo_id: string;
+    base_revision: number;
+    base_content_hash: string;
+    expires_at: string;
+  }>();
+
+  if (existing) {
+    return {
+      id: existing.id,
+      memoId: existing.memo_id,
+      baseRevision: existing.base_revision,
+      baseContentHash: existing.base_content_hash,
+      expiresAt: existing.expires_at,
+    };
+  }
+
   const session: MemoEditSession = {
     id: createId("edit"),
     memoId,
@@ -1962,7 +2252,6 @@ const deleteMemosRecord = async (
     }
 
     statements.push(
-      db.prepare(`DELETE FROM memos_fts WHERE memo_id IN (${placeholders})`).bind(...uniqueMemoIds),
       db.prepare(`DELETE FROM resources WHERE memo_id IN (${placeholders})`).bind(...uniqueMemoIds),
       db.prepare(`DELETE FROM memo_revisions WHERE memo_id IN (${placeholders})`).bind(...uniqueMemoIds),
       db.prepare(`DELETE FROM memo_contents WHERE memo_id IN (${placeholders})`).bind(...uniqueMemoIds),
@@ -1989,7 +2278,7 @@ const deleteMemosRecord = async (
            WHERE is_deleted = 0 AND memo_id IN (${placeholders})`
         )
         .bind(now, now, ...uniqueMemoIds),
-      db.prepare(`DELETE FROM memos_fts WHERE memo_id IN (${placeholders})`).bind(...uniqueMemoIds)
+      deleteMemoSearchDocumentsStatement(db, uniqueMemoIds)
     );
 
     for (const memoId of uniqueMemoIds) {
@@ -2115,13 +2404,7 @@ const restoreMemosRecord = async (
            WHERE memo_id = ? AND is_deleted = 1`
         )
         .bind(now, row.id),
-      db.prepare(`DELETE FROM memos_fts WHERE memo_id = ?`).bind(row.id),
-      db
-        .prepare(
-          `INSERT INTO memos_fts (memo_id, title, content_text, tags)
-           VALUES (?, ?, ?, ?)`
-        )
-        .bind(row.id, row.title, row.content_text, tags.join(" ")),
+      upsertMemoSearchDocumentStatement(db, row.id, row.title, row.content_text, tags.join(" ")),
       auditStatement(db, actor.actorType, actor.actorId, "memo.restore", "memo", row.id, {
         fromNotebookId: row.notebook_id,
         toNotebookId: restoreNotebookId,
@@ -2183,7 +2466,6 @@ const emptyTrashMemosRecord = async (
   }
 
   await db.batch([
-    db.prepare(`DELETE FROM memos_fts WHERE memo_id IN (SELECT id FROM memos WHERE workspace_id = ? AND is_deleted = 1)`).bind(workspaceId),
     db.prepare(`UPDATE resources SET original_memo_id = NULL WHERE original_memo_id IN (SELECT id FROM memos WHERE workspace_id = ? AND is_deleted = 1)`).bind(workspaceId),
     db.prepare(`DELETE FROM resources WHERE memo_id IN (SELECT id FROM memos WHERE workspace_id = ? AND is_deleted = 1)`).bind(workspaceId),
     db.prepare(`DELETE FROM memo_revisions WHERE memo_id IN (SELECT id FROM memos WHERE workspace_id = ? AND is_deleted = 1)`).bind(workspaceId),
@@ -2206,7 +2488,7 @@ const ensureLocalDemoSeed = (env: Bindings) => {
     const memoPlaceholders = DEMO_SEED_MEMO_IDS.map(() => "?").join(", ");
     await env.storage.db.batch([
       env.storage.db.prepare(`DELETE FROM mobile_sync_changes`),
-      env.storage.db.prepare(`DELETE FROM memos_fts`),
+      env.storage.db.prepare(`DELETE FROM memo_search_documents`),
       env.storage.db.prepare(`DELETE FROM resources`),
       env.storage.db.prepare(`DELETE FROM memo_revisions`),
       env.storage.db.prepare(`DELETE FROM memo_contents WHERE memo_id NOT IN (${memoPlaceholders})`).bind(...DEMO_SEED_MEMO_IDS),
@@ -2367,13 +2649,7 @@ const ensureDemoSeed = async (
           now,
           now,
         ),
-      db.prepare(`DELETE FROM memos_fts WHERE memo_id = ?`).bind(memo.id),
-      db
-        .prepare(
-          `INSERT INTO memos_fts (memo_id, title, content_text, tags)
-           VALUES (?, ?, ?, ?)`
-        )
-        .bind(memo.id, memo.title, contentText, memo.tags.join(" "))
+      upsertMemoSearchDocumentStatement(db, memo.id, memo.title, contentText, memo.tags.join(" "))
     );
   }
 
@@ -2493,54 +2769,91 @@ const ensureDemoSeed = async (
   }
 };
 
+export const acquireMaintenanceLease = async (
+  db: D1Database,
+  name: string,
+  leaseMs: number,
+) => {
+  const ownerId = createId("lease");
+  const acquiredAt = isoNow();
+  const expiresAt = new Date(Date.now() + leaseMs).toISOString();
+  const acquired = await db.prepare(
+    `INSERT INTO maintenance_leases (name, owner_id, acquired_at, expires_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(name) DO UPDATE SET
+       owner_id = excluded.owner_id,
+       acquired_at = excluded.acquired_at,
+       expires_at = excluded.expires_at
+     WHERE maintenance_leases.expires_at <= excluded.acquired_at
+     RETURNING owner_id`,
+  ).bind(name, ownerId, acquiredAt, expiresAt).first<{ owner_id: string }>();
+
+  return acquired?.owner_id === ownerId ? ownerId : null;
+};
+
 const resetDemoData = async (
   env: Bindings,
   scheduledTime: number,
   options: { resetCredentials?: boolean } = {}
 ) => {
   const db = env.storage.db;
+  const leaseOwnerId = await acquireMaintenanceLease(db, "demo-reset", DEMO_RESET_LEASE_MS);
+  if (!leaseOwnerId) return false;
+
   const now = isoNow();
-  const demoUsername = env.EDGE_EVER_AUTH_USERNAME?.trim() || "admin";
-  const demoPasswordHash = await resolveDemoPasswordHash(
-    env.EDGE_EVER_AUTH_PASSWORD,
-    env.EDGE_EVER_AUTH_PASSWORD_HASH,
-    hashPassword,
-  );
-  const resourceRows = await db.prepare(`SELECT object_key, storage_config_id FROM resources`).all<{ object_key: string; storage_config_id: string }>();
-  await deleteStoredObjects(env, resourceRows.results);
-
-  const resetStatements: D1PreparedStatement[] = [
-    db.prepare(`DELETE FROM mobile_sync_changes`),
-    db.prepare(`DELETE FROM memos_fts`),
-    db.prepare(`DELETE FROM resources`),
-    db.prepare(`DELETE FROM memo_revisions`),
-    db.prepare(`DELETE FROM memo_contents`),
-    db.prepare(`DELETE FROM memos`),
-    db.prepare(`UPDATE notebooks SET parent_id = NULL`),
-    db.prepare(`DELETE FROM notebooks`),
-    db.prepare(`DELETE FROM api_tokens`),
-    db.prepare(`DELETE FROM audit_events`),
-  ];
-
-  if (options.resetCredentials && demoPasswordHash) {
-    resetStatements.push(
-      db.prepare(`UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ? AND is_disabled = 0`)
-        .bind(demoPasswordHash, now, demoUsername),
-      db.prepare(
-        `UPDATE sessions SET revoked_at = ?
-         WHERE user_id IN (SELECT id FROM users WHERE username = ? AND is_disabled = 0)
-           AND revoked_at IS NULL`
-      ).bind(now, demoUsername),
+  try {
+    const demoUsername = env.EDGE_EVER_AUTH_USERNAME?.trim() || "admin";
+    const demoPasswordHash = await resolveDemoPasswordHash(
+      env.EDGE_EVER_AUTH_PASSWORD,
+      env.EDGE_EVER_AUTH_PASSWORD_HASH,
+      hashPassword,
     );
+    const resourceRows = await db.prepare(`SELECT object_key, storage_config_id FROM resources`).all<{ object_key: string; storage_config_id: string }>();
+    await deleteStoredObjects(env, resourceRows.results);
+
+    const resetStatements: D1PreparedStatement[] = [
+      db.prepare(`DELETE FROM mobile_sync_changes`),
+      db.prepare(`DELETE FROM memo_search_documents`),
+      db.prepare(`DELETE FROM resources`),
+      db.prepare(`DELETE FROM memo_revisions`),
+      db.prepare(`DELETE FROM memo_contents`),
+      db.prepare(`DELETE FROM memos`),
+      db.prepare(`UPDATE notebooks SET parent_id = NULL`),
+      db.prepare(`DELETE FROM notebooks`),
+      db.prepare(`DELETE FROM api_tokens`),
+      db.prepare(`DELETE FROM audit_events`),
+    ];
+
+    if (options.resetCredentials && demoPasswordHash) {
+      resetStatements.push(
+        db.prepare(`UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ? AND is_disabled = 0`)
+          .bind(demoPasswordHash, now, demoUsername),
+        db.prepare(
+          `UPDATE sessions SET revoked_at = ?
+           WHERE user_id IN (SELECT id FROM users WHERE username = ? AND is_disabled = 0)
+             AND revoked_at IS NULL`
+        ).bind(now, demoUsername),
+      );
+    }
+
+    await db.batch(resetStatements);
+
+    await ensureDemoSeed(env, { overwriteExisting: true, refreshResources: true });
+    await audit(db, "system", null, "demo.reset", "demo", "edgeever-demo", {
+      scheduledTime: new Date(scheduledTime).toISOString(),
+      seedMemoCount: DEMO_SEED_MEMOS.length,
+    });
+
+    await db.prepare(
+      `UPDATE maintenance_leases SET expires_at = ? WHERE name = 'demo-reset' AND owner_id = ?`,
+    ).bind(new Date(Date.now() + DEMO_RESET_COOLDOWN_MS).toISOString(), leaseOwnerId).run();
+    return true;
+  } catch (error) {
+    await db.prepare(
+      `DELETE FROM maintenance_leases WHERE name = 'demo-reset' AND owner_id = ?`,
+    ).bind(leaseOwnerId).run();
+    throw error;
   }
-
-  await db.batch(resetStatements);
-
-  await ensureDemoSeed(env, { overwriteExisting: true, refreshResources: true });
-  await audit(db, "system", null, "demo.reset", "demo", "edgeever-demo", {
-    scheduledTime: new Date(scheduledTime).toISOString(),
-    seedMemoCount: DEMO_SEED_MEMOS.length,
-  });
 };
 
 const moveMemosToNotebook = async (
@@ -2695,12 +3008,7 @@ const mergeMemosRecord = async (
         ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
       )
       .bind(newMemoId, JSON.stringify(contentJson), mergedMarkdown, contentText, contentHash, now, now),
-    db
-      .prepare(
-        `INSERT INTO memos_fts (memo_id, title, content_text, tags)
-         VALUES (?, ?, ?, ?)`
-      )
-      .bind(newMemoId, title, contentText, tags.join(" ")),
+    upsertMemoSearchDocumentStatement(db, newMemoId, title, contentText, tags.join(" ")),
     db
       .prepare(
         `UPDATE memos
@@ -2709,7 +3017,7 @@ const mergeMemosRecord = async (
       )
       .bind(now, newMemoId, now, now, workspaceId, ...uniqueMemoIds),
     db.prepare(`DELETE FROM memo_shares WHERE workspace_id = ? AND memo_id IN (${placeholders})`).bind(workspaceId, ...uniqueMemoIds),
-    db.prepare(`DELETE FROM memos_fts WHERE memo_id IN (${placeholders})`).bind(...uniqueMemoIds),
+    deleteMemoSearchDocumentsStatement(db, uniqueMemoIds),
     db
       .prepare(
         `UPDATE resources
@@ -2767,12 +3075,7 @@ const createMemoRecord = async (
         ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
       )
       .bind(id, JSON.stringify(contentJson), contentMarkdown, contentText, contentHash, createdAt, updatedAt),
-    db
-      .prepare(
-        `INSERT INTO memos_fts (memo_id, title, content_text, tags)
-         VALUES (?, ?, ?, ?)`
-      )
-      .bind(id, title, contentText, tags.join(" ")),
+    upsertMemoSearchDocumentStatement(db, id, title, contentText, tags.join(" ")),
     auditStatement(db, actor.actorType, actor.actorId, "memo.create", "memo", id, {
       notebookId: input.notebookId,
     }),
@@ -2855,7 +3158,6 @@ const getMemoImportSource = async (db: D1Database, workspaceId: string, source: 
 
 const discardUnlinkedImportedMemo = async (db: D1Database, workspaceId: string, memoId: string) => {
   await db.batch([
-    db.prepare(`DELETE FROM memos_fts WHERE memo_id = ?`).bind(memoId),
     db.prepare(`DELETE FROM memo_revisions WHERE memo_id = ?`).bind(memoId),
     db.prepare(`DELETE FROM memo_contents WHERE memo_id = ?`).bind(memoId),
     db.prepare(`DELETE FROM memos WHERE id = ? AND workspace_id = ?`).bind(memoId, workspaceId),
@@ -2973,7 +3275,7 @@ const importMemosRecord = async (
   };
 };
 
-const updateMemoRecord = async (
+export const updateMemoRecord = async (
   db: D1Database,
   workspaceId: string,
   id: string,
@@ -3108,8 +3410,12 @@ const updateMemoRecord = async (
         ? markdownToDoc(input.contentMarkdown)
         : currentContentJson;
   const contentMarkdown =
-    input.contentMarkdown !== undefined ? input.contentMarkdown : docToMarkdown(contentJson);
-  const contentText = docToText(contentJson);
+    input.contentMarkdown !== undefined
+      ? input.contentMarkdown
+      : input.contentJson !== undefined
+        ? docToMarkdown(contentJson)
+        : current.content_markdown;
+  const contentText = hasDocumentUpdate ? docToText(contentJson) : current.content_text;
   const title =
     input.title !== undefined ? normalizeMemoTitle(input.title) : normalizeMemoTitle(current.title);
   if (
@@ -3124,8 +3430,21 @@ const updateMemoRecord = async (
   const tags = input.tags === undefined ? parseJsonArray(current.tags_json) : normalizeTags(input.tags);
   const excerpt = createExcerpt(contentText);
   const notebookId = input.notebookId ?? current.notebook_id;
-  const nextRevision = current.revision + 1;
   const contentHash = await sha256(contentMarkdown + JSON.stringify(contentJson));
+  const unchanged =
+    notebookId === current.notebook_id
+    && title === normalizeMemoTitle(current.title)
+    && JSON.stringify(tags) === current.tags_json
+    && isPinned === Boolean(current.is_pinned)
+    && contentHash === current.content_hash
+    && input.createdAt === undefined
+    && input.updatedAt === undefined;
+
+  if (unchanged) {
+    return { memo: mapMemoDetail(current) };
+  }
+
+  const nextRevision = current.revision + 1;
   const revisionStatements = (await shouldSnapshotMemoRevision(db, current, title, JSON.stringify(tags), contentHash, updatedAt))
     ? [createMemoRevisionStatement(db, current, actorLabel, updatedAt)]
     : [];
@@ -3176,13 +3495,7 @@ const updateMemoRecord = async (
          WHERE memo_id = ?`
       )
       .bind(JSON.stringify(contentJson), contentMarkdown, contentText, contentHash, nextRevision, updatedAt, input.createdAt ?? null, id),
-    db.prepare(`DELETE FROM memos_fts WHERE memo_id = ?`).bind(id),
-    db
-      .prepare(
-        `INSERT INTO memos_fts (memo_id, title, content_text, tags)
-         VALUES (?, ?, ?, ?)`
-      )
-      .bind(id, title, contentText, tags.join(" ")),
+    upsertMemoSearchDocumentStatement(db, id, title, contentText, tags.join(" ")),
     ...editSessionStatements,
     auditStatement(db, actor.actorType, actor.actorId, "memo.update", "memo", id, {
       revision: nextRevision,
@@ -3290,13 +3603,7 @@ const restoreMemoRevisionRecord = async (
          WHERE memo_id = ?`
       )
       .bind(JSON.stringify(contentJson), contentMarkdown, contentText, contentHash, nextRevision, now, memoId),
-    db.prepare(`DELETE FROM memos_fts WHERE memo_id = ?`).bind(memoId),
-    db
-      .prepare(
-        `INSERT INTO memos_fts (memo_id, title, content_text, tags)
-         VALUES (?, ?, ?, ?)`
-      )
-      .bind(memoId, title, contentText, tags.join(" ")),
+    upsertMemoSearchDocumentStatement(db, memoId, title, contentText, tags.join(" ")),
     auditStatement(db, actor.actorType, actor.actorId, "memo.revision_restore", "memo", memoId, {
       revisionId,
       restoredRevision: revision.revision,
@@ -3482,9 +3789,10 @@ const getWorkspaceStats = async (db: D1Database, workspaceId: string) => {
     db.prepare(`SELECT COUNT(*) AS count FROM notebooks WHERE workspace_id = ? AND is_deleted = 0`).bind(workspaceId).first<{ count: number }>(),
     db
       .prepare(
-        `SELECT COUNT(DISTINCT json_each.value) AS count
-         FROM memos m, json_each(m.tags_json)
-         WHERE m.workspace_id = ? AND m.is_deleted = 0 AND trim(json_each.value) <> ''`
+        `SELECT COUNT(DISTINCT mt.name) AS count
+         FROM memo_tags mt
+         INNER JOIN memos m ON m.id = mt.memo_id AND m.workspace_id = mt.workspace_id
+         WHERE mt.workspace_id = ? AND m.is_deleted = 0`
       )
       .bind(workspaceId).first<{ count: number }>(),
     db

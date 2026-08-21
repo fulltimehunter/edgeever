@@ -79,4 +79,125 @@ describe("sync route contracts", () => {
       nextAfterId: "memo_1",
     });
   });
+
+  test("loads changes and workspace cursor state in one indexed query", async () => {
+    const sqlStatements = [];
+    const database = {
+      prepare: (sql) => {
+        sqlStatements.push(sql);
+        return {
+          bind: () => ({
+            all: async () => ({ results: [{
+              id: null,
+              entity_type: null,
+              entity_id: null,
+              operation: null,
+              server_cursor: 0,
+              sync_identity: "workspace-created-at",
+            }] }),
+            first: async () => null,
+          }),
+        };
+      },
+    };
+    const response = await createApp().request(
+      "/api/v1/sync/changes?cursor=0&limit=200",
+      {},
+      { storage: { db: database, resources: {} } },
+    );
+
+    expect(response.status).toBe(200);
+    expect(sqlStatements).toHaveLength(1);
+    const cursorSql = sqlStatements[0];
+    expect(cursorSql).toContain("WHERE c.workspace_id = w.id");
+    expect(cursorSql).toContain("WHERE workspace_id = ? AND id > ?");
+  });
+
+  test("folds repeated entities within a page while preserving the raw page cursor", async () => {
+    const database = {
+      prepare: (sql) => ({
+        bind: () => ({
+          all: async () => {
+            if (sql.includes("WITH workspace_state")) {
+              return {
+                results: [
+                  { id: 11, entity_type: "memo", entity_id: "memo_1", operation: "upsert", server_cursor: 13, sync_identity: "workspace-created-at" },
+                  { id: 12, entity_type: "memo", entity_id: "memo_1", operation: "upsert", server_cursor: 13, sync_identity: "workspace-created-at" },
+                  { id: 13, entity_type: "notebook", entity_id: "notebook_1", operation: "delete", server_cursor: 13, sync_identity: "workspace-created-at" },
+                ],
+              };
+            }
+            if (sql.includes("FROM memos m")) return { results: [{ id: "memo_1", title: "Latest" }] };
+            return { results: [] };
+          },
+          first: async () => null,
+        }),
+      }),
+    };
+    const response = await createApp().request(
+      "/api/v1/sync/changes?cursor=10&limit=200",
+      {},
+      { storage: { db: database, resources: {} } },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      changes: [
+        {
+          cursor: 12,
+          entityType: "memo",
+          entityId: "memo_1",
+          operation: "upsert",
+          notebook: null,
+          memo: { id: "memo_1", title: "Latest" },
+        },
+        {
+          cursor: 13,
+          entityType: "notebook",
+          entityId: "notebook_1",
+          operation: "delete",
+          notebook: null,
+          memo: null,
+        },
+      ],
+      cursor: 13,
+      hasMore: false,
+      serverCursor: 13,
+      syncIdentity: "workspace-created-at",
+    });
+  });
+
+  test("does not fold changes across a raw page boundary", async () => {
+    const database = {
+      prepare: (sql) => ({
+        bind: () => ({
+          all: async () => {
+            if (sql.includes("WITH workspace_state")) {
+              return {
+                results: [
+                  { id: 21, entity_type: "memo", entity_id: "memo_1", operation: "delete", server_cursor: 22, sync_identity: "workspace-created-at" },
+                  { id: 22, entity_type: "memo", entity_id: "memo_1", operation: "upsert", server_cursor: 22, sync_identity: "workspace-created-at" },
+                ],
+              };
+            }
+            return { results: [] };
+          },
+          first: async () => null,
+        }),
+      }),
+    };
+    const response = await createApp().request(
+      "/api/v1/sync/changes?cursor=20&limit=1",
+      {},
+      { storage: { db: database, resources: {} } },
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      changes: [{ cursor: 21, operation: "delete" }],
+      cursor: 21,
+      hasMore: true,
+      serverCursor: 22,
+    });
+  });
 });

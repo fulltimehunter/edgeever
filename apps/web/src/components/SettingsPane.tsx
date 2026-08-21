@@ -16,12 +16,13 @@ import { useTranslation } from "react-i18next";
 import * as m from "motion/react-m";
 import { SystemInfoDialog } from "@/components/SystemInfoDialog";
 import { Button } from "@/components/ui/button";
-import type { ShortcutSettings } from "@/lib/app-helpers";
+import type { EditorContentAlignment, ShortcutSettings } from "@/lib/app-helpers";
 import { WORKSPACE_PAGE_TITLE_CLASSNAME } from "@/lib/workspace-ui";
 import { cn } from "@/lib/utils";
 import { AdvancedPlayCard } from "./settings/AdvancedPlayCard";
 import { AccountInfoCard } from "./settings/AccountInfoCard";
 import { DataExportCard } from "./settings/DataExportCard";
+import { DesktopLocalDataCard } from "./settings/DesktopLocalDataCard";
 import { LoginDevicesCard } from "./settings/LoginDevicesCard";
 import { EvernoteImportGuideCard } from "./settings/EvernoteImportGuideCard";
 import { FeedbackLink } from "./settings/FeedbackLink";
@@ -33,9 +34,14 @@ import { UserManagementCard } from "./settings/UserManagementCard";
 import { ObjectStorageCard } from "./settings/ObjectStorageCard";
 import { AiModelCard } from "./settings/AiModelCard";
 import { AiPromptsCard } from "./settings/AiPromptsCard";
+import { AiGenerationPreferenceCard } from "./settings/AiGenerationPreferenceCard";
+import { AiTagSuggestionPromptCard } from "./settings/AiTagSuggestionPromptCard";
 import { ThemeToggle } from "./ThemeToggle";
 import type { AuthUser } from "@edgeever/shared";
 import { contentEnterMotion } from "@/lib/motion";
+import type { EdgeEverPluginHost } from "@/lib/plugins/plugin-host";
+import { PluginToolbarMenu } from "./plugins/PluginToolbarMenu";
+import { useDeployedUpdateNotice } from "@/hooks/useDeployedUpdateNotice";
 
 interface SettingsPaneProps {
   onClose: () => void;
@@ -47,6 +53,8 @@ interface SettingsPaneProps {
   onSyncIntervalChange: (intervalMs: number | null) => void;
   shortcutSettings: ShortcutSettings;
   onShortcutSettingsChange: (settings: ShortcutSettings) => void;
+  editorContentAlignment: EditorContentAlignment;
+  onEditorContentAlignmentChange: (alignment: EditorContentAlignment) => void;
   onLogout: () => void;
   isLoggingOut: boolean;
   authRequired: boolean;
@@ -54,6 +62,8 @@ interface SettingsPaneProps {
   isOwner: boolean;
   user: AuthUser | null;
   refreshWorkspaceAfterImport: () => Promise<void>;
+  pluginHost: EdgeEverPluginHost;
+  onOpenPluginMarketplace: () => void;
 }
 
 // Slate and brand color variables already switch values with the root theme.
@@ -86,6 +96,8 @@ export const SettingsPane = ({
   onSyncIntervalChange,
   shortcutSettings,
   onShortcutSettingsChange,
+  editorContentAlignment,
+  onEditorContentAlignmentChange,
   onLogout,
   isLoggingOut,
   authRequired,
@@ -93,11 +105,15 @@ export const SettingsPane = ({
   isOwner,
   user,
   refreshWorkspaceAfterImport,
+  pluginHost,
+  onOpenPluginMarketplace,
 }: SettingsPaneProps) => {
   const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<TabKey>("general");
   const [activeMobileTab, setActiveMobileTab] = useState<TabKey | null>(null);
   const [systemInfoOpen, setSystemInfoOpen] = useState(false);
+  const { unseen: deployedUpdateUnseen } = useDeployedUpdateNotice();
+  const canClearLocalData = Boolean(window.edgeeverDesktop?.canClearLocalData);
 
   const tabItems: TabItem[] = [
     {
@@ -138,17 +154,17 @@ export const SettingsPane = ({
             hoverColorClass: "hover:bg-emerald-50/40",
             iconColorClass: "text-emerald-600",
           },
-          {
-            key: "advanced" as const,
-            label: t("settings.tabs.advanced"),
-            icon: Wrench,
-            colorClass: "text-emerald-700",
-            bgColorClass: "bg-emerald-50/80",
-            hoverColorClass: "hover:bg-emerald-50/40",
-            iconColorClass: "text-emerald-600",
-          },
         ]
       : []),
+    {
+      key: "advanced",
+      label: t("settings.tabs.advanced"),
+      icon: Wrench,
+      colorClass: "text-emerald-700",
+      bgColorClass: "bg-emerald-50/80",
+      hoverColorClass: "hover:bg-emerald-50/40",
+      iconColorClass: "text-emerald-600",
+    },
     {
       key: "account",
       label: t("settings.tabs.account"),
@@ -204,6 +220,8 @@ export const SettingsPane = ({
               onSyncIntervalChange={onSyncIntervalChange}
               shortcutSettings={shortcutSettings}
               onShortcutSettingsChange={onShortcutSettingsChange}
+              editorContentAlignment={editorContentAlignment}
+              onEditorContentAlignmentChange={onEditorContentAlignmentChange}
             />
             <FeedbackLink className="hidden lg:flex" />
           </SettingsGroup>
@@ -231,11 +249,14 @@ export const SettingsPane = ({
           </SettingsGroup>
         );
       case "advanced":
-        return isOwner ? (
+        return (
           <SettingsGroup>
-            <ObjectStorageCard demoMode={demoMode} />
+            <AiGenerationPreferenceCard />
+            <AiTagSuggestionPromptCard />
+            {isOwner ? <ObjectStorageCard demoMode={demoMode} /> : null}
+            {canClearLocalData ? <DesktopLocalDataCard /> : null}
           </SettingsGroup>
-        ) : null;
+        );
       case "account":
         return (
           <SettingsGroup>
@@ -271,7 +292,13 @@ export const SettingsPane = ({
             </h1>
           </div>
         </div>
-        <ThemeToggle className="inline-flex" showLabel />
+        <div className="flex items-center gap-1">
+          <PluginToolbarMenu
+            host={pluginHost}
+            onManage={onOpenPluginMarketplace}
+          />
+          <ThemeToggle className="inline-flex" showLabel />
+        </div>
       </header>
 
       <div className="flex flex-1 min-h-0 min-w-0 bg-slate-50/50">
@@ -370,8 +397,9 @@ export const SettingsPane = ({
                   className="flex min-h-16 w-full items-center justify-between gap-3 px-4 py-2.5 text-left text-slate-600 transition-colors hover:bg-slate-200/50 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70"
                 >
                   <span className="flex min-w-0 items-center gap-3">
-                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-50/80">
+                    <span className="relative flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-50/80">
                       <Info className="h-4 w-4 text-emerald-600" />
+                      {deployedUpdateUnseen ? <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-emerald-500 ring-2 ring-white" /> : null}
                     </span>
                     <span className="min-w-0">
                       <span className="block truncate text-sm font-semibold">{t("systemInfo.title")}</span>

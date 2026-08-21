@@ -29,16 +29,33 @@ import type {
   AiTargetLanguage,
   AiTone,
   AiStreamEvent,
+  AiTagSuggestionPromptUpdateInput,
+  AiTagSuggestionsRequestInput,
+  AiTagSuggestionsResponse,
   PublicMemoShare,
   TagSummary,
   TiptapDoc,
   SyncBootstrapResponse,
   SyncChangesResponse,
 } from "@edgeever/shared";
+import { resolveInstanceUrlInput } from "@edgeever/shared";
 import type { MemoFilterMode, MemoSortMode } from "./app-helpers";
+import { readAiStreamingPreference } from "./ai-generation-preference";
 
 type ListNotebooksResponse = {
   notebooks: Notebook[];
+};
+
+export type InstanceRelease = {
+  version: string;
+  changes: Record<string, string[]>;
+};
+
+export type InstanceHealth = {
+  ok: true;
+  name: string;
+  runtime: string;
+  authMode: string;
 };
 
 type ListMemosResponse = {
@@ -192,7 +209,7 @@ export class DesktopInstanceUrlError extends Error {
 }
 
 export const saveDesktopApiBaseUrl = async (value: string) => {
-  const normalized = value.trim().replace(/\/$/, "");
+  const normalized = resolveInstanceUrlInput(value).replace(/\/$/, "");
   let parsed: URL;
   try {
     parsed = new URL(normalized);
@@ -291,8 +308,8 @@ export type ApiResponseDiagnostics = {
 let desktopSessionRejected = false;
 let unauthorizedConfirmPromise: Promise<boolean> | null = null;
 
-const isDesktopAuthenticationRequest = (path: string) =>
-  path === "/api/v1/auth/login" || path === "/api/v1/auth/session";
+const isDesktopPublicRequest = (path: string) =>
+  path === "/api/release" || path === "/api/v1/auth/login" || path === "/api/v1/auth/session";
 
 /**
  * Confirm the browser is actually logged out before forcing the login screen.
@@ -330,8 +347,20 @@ const confirmSessionLost = async (): Promise<boolean> => {
   return unauthorizedConfirmPromise;
 };
 
-const notifyUnauthorized = async (isDesktop: boolean) => {
+const notifyUnauthorized = async (isDesktop: boolean, rejectedDesktopSessionToken?: string) => {
   if (isDesktop && desktopSessionRejected) return;
+
+  // A desktop API request authenticates with one explicit bearer token. A 401
+  // therefore rejects that exact credential and does not need a second
+  // /auth/session request. Compare against the current token first so a late
+  // response from an older request cannot clear a freshly logged-in session.
+  if (isDesktop && rejectedDesktopSessionToken) {
+    if (getDesktopSessionToken() !== rejectedDesktopSessionToken) return;
+    clearCachedDesktopSession();
+    desktopSessionRejected = true;
+    window.dispatchEvent(new CustomEvent("edgeever:unauthorized"));
+    return;
+  }
 
   const sessionLost = await confirmSessionLost();
   if (!sessionLost) return;
@@ -348,7 +377,7 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const isDesktop = Boolean(typeof window !== "undefined" && window.edgeeverDesktop?.isAvailable);
   const sessionToken = isDesktop ? getDesktopSessionToken() : undefined;
 
-  if (isDesktop && desktopSessionRejected && !isDesktopAuthenticationRequest(path)) {
+  if (isDesktop && desktopSessionRejected && !isDesktopPublicRequest(path)) {
     throw new ApiRequestError("Authentication required", 401, "unauthorized");
   }
 
@@ -385,7 +414,7 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
     };
 
     if (response.status === 401 && path !== "/api/v1/auth/login") {
-      void notifyUnauthorized(isDesktop);
+      void notifyUnauthorized(isDesktop, sessionToken);
     }
 
     throw new ApiRequestError(
@@ -417,7 +446,28 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   return body;
 };
 
+const requestArrayBuffer = async (path: string) => {
+  const isDesktop = Boolean(typeof window !== "undefined" && window.edgeeverDesktop?.isAvailable);
+  const sessionToken = isDesktop ? getDesktopSessionToken() : undefined;
+  const headers = new Headers();
+  if (sessionToken) headers.set("Authorization", `Bearer ${sessionToken}`);
+  const response = await fetch(`${getConfiguredDesktopApiBaseUrl()}${path}`, {
+    credentials: "include",
+    headers,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { error?: { message?: string } } | null;
+    if (response.status === 401) void notifyUnauthorized(isDesktop, sessionToken);
+    throw new ApiRequestError(body?.error?.message || response.statusText || "Binary download failed", response.status);
+  }
+  return response.arrayBuffer();
+};
+
 export const api = {
+  getInstanceHealth: () => request<InstanceHealth>("/api/health"),
+
+  getInstanceRelease: () => request<InstanceRelease>("/api/release"),
+
   getSession: () => request<AuthSession>("/api/v1/auth/session"),
 
   getPublicMemoShare: (token: string) =>
@@ -525,7 +575,10 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  getAiSettings: () => request<AiSettings>("/api/v1/ai/settings"),
+  getAiSettings: (locale?: string) => {
+    const search = locale ? `?locale=${encodeURIComponent(locale)}` : "";
+    return request<AiSettings>(`/api/v1/ai/settings${search}`);
+  },
 
   createAiProvider: (payload: AiProviderCreatePayload) =>
     request<AiSettings>("/api/v1/ai/providers", {
@@ -578,6 +631,12 @@ export const api = {
       body: JSON.stringify({ modelConfigId }),
     }),
 
+  updateAiTagSuggestionPrompt: (payload: AiTagSuggestionPromptUpdateInput, locale?: string) =>
+    request<AiSettings>(`/api/v1/ai/tag-suggestion-prompt${locale ? `?locale=${encodeURIComponent(locale)}` : ""}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+
   listAiPrompts: (locale?: string) => {
     const search = locale ? `?locale=${encodeURIComponent(locale)}` : "";
     return request<{ prompts: AiPromptTemplate[] }>(`/api/v1/ai/prompts${search}`);
@@ -611,6 +670,13 @@ export const api = {
     });
   },
 
+  suggestAiTags: (payload: AiTagSuggestionsRequestInput, signal?: AbortSignal) =>
+    request<AiTagSuggestionsResponse>("/api/v1/ai/tag-suggestions", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      signal,
+    }),
+
   streamAiGeneration: async (
     payload: {
       action: AiAction;
@@ -618,6 +684,7 @@ export const api = {
       locale?: string;
       title: string;
       contentMarkdown: string;
+      stream?: boolean;
       targetLanguage?: AiTargetLanguage;
       tone?: AiTone;
       instruction?: string;
@@ -633,7 +700,10 @@ export const api = {
       method: "POST",
       credentials: "include",
       headers,
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        ...payload,
+        stream: payload.stream ?? readAiStreamingPreference(),
+      }),
       signal: options.signal,
     });
     if (!response.ok) {
@@ -706,6 +776,7 @@ export const api = {
     notebookId?: string | null;
     includeDescendants?: boolean;
     q?: string;
+    tag?: string;
     trash?: boolean;
     sort?: MemoSortMode;
     filter?: MemoFilterMode;
@@ -724,6 +795,10 @@ export const api = {
 
     if (params.q?.trim()) {
       search.set("q", params.q.trim());
+    }
+
+    if (params.tag?.trim()) {
+      search.set("tag", params.tag.trim());
     }
 
     if (params.trash) {
@@ -894,6 +969,15 @@ export const api = {
 
     return response.blob();
   },
+
+  downloadGithubPluginAsset: (
+    owner: string,
+    repository: string,
+    assetId: number,
+    assetName: "manifest.json" | "main.js" | "styles.css",
+  ) => requestArrayBuffer(
+    `/api/v1/plugins/github/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/assets/${assetId}/${encodeURIComponent(assetName)}`,
+  ),
 
   uploadMemoResource: (memoId: string, file: File) => {
     const form = new FormData();

@@ -5,10 +5,12 @@ import { mapNotebook, type NotebookRow } from "./notebook-service";
 import { getWorkspaceId, requireScopes } from "./request-auth";
 
 type MobileSyncChangeRow = {
-  id: number;
-  entity_type: "notebook" | "memo";
-  entity_id: string;
-  operation: "upsert" | "delete";
+  id: number | null;
+  entity_type: "notebook" | "memo" | null;
+  entity_id: string | null;
+  operation: "upsert" | "delete" | null;
+  server_cursor: number;
+  sync_identity: string;
 };
 
 export type SyncMemoDetailRow = {
@@ -74,11 +76,14 @@ export const registerSyncRoutes = (
         `SELECT COUNT(*) AS count FROM memos WHERE workspace_id = ?`,
       ).bind(workspaceId).first<{ count: number }>(),
       context.env.storage.db.prepare(
-        `SELECT w.created_at AS sync_identity, COALESCE(MAX(c.id), 0) AS cursor
+        `SELECT w.created_at AS sync_identity,
+                COALESCE((
+                  SELECT MAX(c.id)
+                  FROM mobile_sync_changes c
+                  WHERE c.workspace_id = w.id
+                ), 0) AS cursor
          FROM workspaces w
-         LEFT JOIN mobile_sync_changes c ON c.workspace_id = w.id
-         WHERE w.id = ?
-         GROUP BY w.created_at`,
+         WHERE w.id = ?`,
       ).bind(workspaceId).first<{ cursor: number; sync_identity: string }>(),
     ]);
     const page = memoRows.results.slice(0, limit);
@@ -103,27 +108,46 @@ export const registerSyncRoutes = (
       Number.MAX_SAFE_INTEGER,
     );
     const limit = dependencies.clampNumber(Number(context.req.query("limit") ?? 100), 1, 200);
-    const [rows, cursorRow] = await Promise.all([
-      context.env.storage.db.prepare(
-        `SELECT id, entity_type, entity_id, operation
+    const rows = await context.env.storage.db.prepare(
+      `WITH workspace_state AS (
+         SELECT w.created_at AS sync_identity,
+                COALESCE((
+                  SELECT MAX(c.id)
+                  FROM mobile_sync_changes c
+                  WHERE c.workspace_id = w.id
+                ), 0) AS server_cursor
+         FROM workspaces w
+         WHERE w.id = ?
+       ), page_changes AS (
+         SELECT id, entity_type, entity_id, operation
          FROM mobile_sync_changes
          WHERE workspace_id = ? AND id > ?
          ORDER BY id ASC
-         LIMIT ?`,
-      ).bind(workspaceId, cursor, limit + 1).all<MobileSyncChangeRow>(),
-      context.env.storage.db.prepare(
-        `SELECT w.created_at AS sync_identity, COALESCE(MAX(c.id), 0) AS cursor
-         FROM workspaces w
-         LEFT JOIN mobile_sync_changes c ON c.workspace_id = w.id
-         WHERE w.id = ?
-         GROUP BY w.created_at`,
-      ).bind(workspaceId).first<{ cursor: number; sync_identity: string }>(),
-    ]);
-    const page = rows.results.slice(0, limit);
-    const memoIds = Array.from(new Set(page
+         LIMIT ?
+       )
+       SELECT c.id, c.entity_type, c.entity_id, c.operation,
+              s.server_cursor, s.sync_identity
+       FROM workspace_state s
+       LEFT JOIN page_changes c ON 1 = 1
+       ORDER BY c.id ASC`,
+    ).bind(workspaceId, workspaceId, cursor, limit + 1).all<MobileSyncChangeRow>();
+    const cursorRow = rows.results[0];
+    const rawChanges = rows.results.filter((row): row is MobileSyncChangeRow & {
+      id: number;
+      entity_type: "notebook" | "memo";
+      entity_id: string;
+      operation: "upsert" | "delete";
+    } => row.id !== null && row.entity_type !== null && row.entity_id !== null && row.operation !== null);
+    const page = rawChanges.slice(0, limit);
+    const latestPageChanges = new Map<string, (typeof page)[number]>();
+    for (const change of page) {
+      latestPageChanges.set(`${change.entity_type}:${change.entity_id}`, change);
+    }
+    const compactedPage = Array.from(latestPageChanges.values()).sort((left, right) => left.id - right.id);
+    const memoIds = Array.from(new Set(compactedPage
       .filter((change) => change.entity_type === "memo" && change.operation === "upsert")
       .map((change) => change.entity_id)));
-    const notebookIds = Array.from(new Set(page
+    const notebookIds = Array.from(new Set(compactedPage
       .filter((change) => change.entity_type === "notebook" && change.operation === "upsert")
       .map((change) => change.entity_id)));
     const memoPlaceholders = memoIds.map(() => "?").join(", ");
@@ -153,7 +177,7 @@ export const registerSyncRoutes = (
     ]);
     const memosById = new Map(memoRows.results.map((row) => [row.id, dependencies.mapMemoDetail(row)]));
     const notebooksById = new Map(notebookRows.results.map((row) => [row.id, mapNotebook(row)]));
-    const changes = page.map((change) => {
+    const changes = compactedPage.map((change) => {
       if (change.entity_type === "memo") {
         const memo = change.operation === "upsert" ? memosById.get(change.entity_id) ?? null : null;
         return {
@@ -182,7 +206,7 @@ export const registerSyncRoutes = (
       changes,
       cursor: page.at(-1)?.id ?? cursor,
       hasMore: rows.results.length > limit,
-      serverCursor: cursorRow?.cursor ?? 0,
+      serverCursor: cursorRow?.server_cursor ?? 0,
       syncIdentity: cursorRow?.sync_identity,
     });
   });

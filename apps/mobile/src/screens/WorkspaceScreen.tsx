@@ -1,9 +1,9 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient, type UseMutationResult } from "@tanstack/react-query";
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient, type InfiniteData, type QueryKey, type UseMutationResult } from "@tanstack/react-query";
 import * as Clipboard from "expo-clipboard";
 import Constants from "expo-constants";
 import { File as ExpoFile } from "expo-file-system";
-import type { MemoFilterMode, MemoSortMode } from "@edgeever/client";
+import type { ListMemosResponse, MemoFilterMode, MemoSortMode } from "@edgeever/client";
 import {
   ActivityIndicator,
   BookOpen,
@@ -33,9 +33,9 @@ import {
   Search,
   ShieldCheck,
   SlidersHorizontal,
-  Sparkles,
   Sun,
   Tag,
+  TagPlus,
   Trash2,
   UserRound,
   X,
@@ -46,6 +46,7 @@ import {
   Image as RNImage,
   type ImageStyle,
   InteractionManager,
+  KeyboardAvoidingView,
   type LayoutChangeEvent,
   Linking,
   Modal,
@@ -71,7 +72,7 @@ import { SvgXml } from "react-native-svg";
 import { ApiRequestError } from "@edgeever/client";
 import { buildGitHubFeedbackUrl, createExcerpt, DEFAULT_MEMO_TITLE, docToMarkdown, docToText, getNotebookDescendantIds, markdownToDoc, resolveMemoContentDoc, type AuthUser, type MemoDetail, type MemoRevision, type MemoSummary, type Notebook, type TiptapDoc } from "@edgeever/shared";
 import { MOBILE_UI_METRICS, getMobileCenteredScrollOffset, getMobileNotebookSearchVisibleIds, toggleMobileMemoFilterMode, toggleMobileMemoSelection } from "@edgeever/shared/mobile-ui";
-import { clearMobileMemoDraft, clearMobileNewMemoDraft, readMobileMemoDraft, readMobileNewMemoDraft, writeMobileMemoDraft, writeMobileNewMemoDraft, type MobileMemoDraft } from "../lib/mobile-drafts";
+import { clearMobileMemoDraft, clearMobileNewMemoDraft, readMobileMemoDraft, writeMobileMemoDraft, type MobileMemoDraft } from "../lib/mobile-drafts";
 import {
   readMobileImageCompressionEnabled,
   readMobileMemoListDensity,
@@ -98,11 +99,13 @@ import {
   type MobileSyncQueueItem,
 } from "../lib/sync-queue";
 import { deleteMobileMemos } from "../lib/mobile-memo-delete";
+import { removeMobileMemosFromListCache } from "../lib/mobile-memo-list-cache";
 import {
   createMobileDataScope,
   getLocalMemo,
   listLocalMemos,
   listLocalNotebooks,
+  listLocalTags,
   resolveLocalMemo,
   syncMobileLocalMirror,
   upsertLocalMemo,
@@ -122,6 +125,7 @@ import { MobileCreateChoiceModal, MobileTemplatePickerModal } from "../component
 import { resolveMobileThemeStyles, useMobileTheme } from "../lib/mobile-theme";
 import { useMobileUpdate } from "../lib/mobile-update";
 import { createMemoSeedHasContent, type MobileCreateMemoSeed } from "../lib/mobile-templates";
+import { createMobileDraftWriteBarrier } from "../lib/mobile-draft-write-barrier";
 import { MobileMermaidDiagram, MobileMermaidProvider } from "../components/MobileMermaid";
 import { getMobileMarkdownFenceLanguage, trimMobileMarkdownFenceContent } from "../lib/mobile-mermaid";
 import {
@@ -219,6 +223,7 @@ type RichEditingSession = {
   memo: MemoDetail;
 };
 type MobileMemoUpdateMutation = UseMutationResult<MemoDetail, Error, { memo: MemoDetail; payload: MobileMemoUpdatePayload }>;
+type MobileMemoListCacheSnapshot = Array<[QueryKey, InfiniteData<ListMemosResponse> | undefined]>;
 
 export const WorkspaceScreen = ({
   incomingShareError = null,
@@ -861,6 +866,30 @@ export const WorkspaceScreen = ({
     void writeMobileImageCompressionEnabled(enabled);
   };
 
+  const optimisticallyRemoveMemoIds = async (memoIds: string[]): Promise<MobileMemoListCacheSnapshot> => {
+    const queryKeys: QueryKey[] = [
+      ["mobile", "memos"],
+      ["mobile", "search"],
+    ];
+    await Promise.all(queryKeys.map((queryKey) => queryClient.cancelQueries({ queryKey })));
+    const snapshot = queryKeys.flatMap((queryKey) =>
+      queryClient.getQueriesData<InfiniteData<ListMemosResponse>>({ queryKey })
+    );
+    const memoIdSet = new Set(memoIds);
+    for (const queryKey of queryKeys) {
+      queryClient.setQueriesData<InfiniteData<ListMemosResponse>>({ queryKey }, (current) =>
+        removeMobileMemosFromListCache(current, memoIdSet)
+      );
+    }
+    return snapshot;
+  };
+
+  const restoreMemoListCache = (snapshot: MobileMemoListCacheSnapshot | undefined) => {
+    for (const [queryKey, data] of snapshot ?? []) {
+      queryClient.setQueryData(queryKey, data);
+    }
+  };
+
   const invalidateWorkspace = async () => {
     if (client) {
       await syncMobileLocalMirror(client, dataScope);
@@ -994,6 +1023,12 @@ export const WorkspaceScreen = ({
   };
 
   const deleteMemoMutation = useMutation({
+    onMutate: async ({ memo }) => {
+      const cacheSnapshot = await optimisticallyRemoveMemoIds([memo.id]);
+      const reopenMemoId = selectedMemoId === memo.id ? memo.id : null;
+      setSelectedMemoId(null);
+      return { cacheSnapshot, reopenMemoId };
+    },
     mutationFn: async ({ memo, permanent }: { memo: MemoDetail; permanent: boolean }) => {
       await deleteMobileMemos({
         client,
@@ -1010,7 +1045,11 @@ export const WorkspaceScreen = ({
       setRichEditingSession(null);
       setSelectedMemoId(null);
     },
-    onError: (error) => {
+    onError: (error, _variables, context) => {
+      restoreMemoListCache(context?.cacheSnapshot);
+      if (context?.reopenMemoId) {
+        setSelectedMemoId(context.reopenMemoId);
+      }
       Alert.alert("删除失败", error instanceof Error ? error.message : "请检查网络后重试");
     },
   });
@@ -1080,6 +1119,13 @@ export const WorkspaceScreen = ({
   });
 
   const deleteMemosMutation = useMutation({
+    onMutate: async ({ memoIds }) => {
+      const cacheSnapshot = await optimisticallyRemoveMemoIds(memoIds);
+      const previousSelectionMode = selectionMode;
+      const previousSelectedMemoIds = new Set(selectedMemoIds);
+      clearSelection();
+      return { cacheSnapshot, previousSelectionMode, previousSelectedMemoIds };
+    },
     mutationFn: async ({ memoIds, permanent }: { memoIds: string[]; permanent: boolean }) => {
       const result = await deleteMobileMemos({
         client,
@@ -1095,7 +1141,10 @@ export const WorkspaceScreen = ({
       await invalidateWorkspace();
       clearSelection();
     },
-    onError: (error) => {
+    onError: (error, _variables, context) => {
+      restoreMemoListCache(context?.cacheSnapshot);
+      setSelectionMode(context?.previousSelectionMode ?? false);
+      setSelectedMemoIds(context?.previousSelectedMemoIds ?? new Set());
       Alert.alert("删除失败", error instanceof Error ? error.message : "请检查网络后重试");
     },
   });
@@ -1336,6 +1385,7 @@ export const WorkspaceScreen = ({
       ) : null}
 
       <MemoDetailModal
+        initialSearchQuery={selectedMemoId ? searchText.trim() : ""}
         isDeleting={deleteMemoMutation.isPending}
         isLoading={memoDetailQuery.isLoading}
         isRestoring={restoreMemoMutation.isPending}
@@ -1739,6 +1789,226 @@ const NotebookPickerModal = ({
   );
 };
 
+const SmartTagButton = ({
+  client,
+  contentMarkdown,
+  disabled = false,
+  onChange,
+  selectedTags,
+  title,
+}: {
+  client: ReturnType<typeof useSession>["client"];
+  contentMarkdown: string;
+  disabled?: boolean;
+  onChange: (tags: string[]) => void;
+  selectedTags: string[];
+  title: string;
+}) => {
+  const { resolvedLocale, translate } = useMobileLocale();
+  const [status, setStatus] = useState<"idle" | "loading" | "success">("idle");
+  const controllerRef = useRef<AbortController | null>(null);
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const unavailable = disabled || !client || selectedTags.length >= 24 || (!title.trim() && !contentMarkdown.trim());
+
+  useEffect(() => () => {
+    controllerRef.current?.abort();
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+  }, []);
+
+  const generateAndApplyTags = async () => {
+    if (unavailable || !client) return;
+    controllerRef.current?.abort();
+    if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setStatus("loading");
+    try {
+      const selectedTagKeys = new Set(selectedTags.map((tag) => tag.toLocaleLowerCase()));
+      const result = await client.suggestAiTags({
+        title,
+        contentMarkdown,
+        currentTags: selectedTags,
+        locale: resolvedLocale,
+      }, controller.signal);
+      const additions = result.suggestions
+        .filter((suggestion) => !selectedTagKeys.has(suggestion.name.toLocaleLowerCase()))
+        .slice(0, Math.max(0, 24 - selectedTags.length))
+        .map((suggestion) => suggestion.name);
+      if (additions.length === 0) {
+        setStatus("idle");
+        Alert.alert(translate("智能标签"), translate("没有找到适合这篇笔记的新标签。"));
+        return;
+      }
+      onChange(Array.from(new Set([...selectedTags, ...additions])).slice(0, 24));
+      setStatus("success");
+      feedbackTimerRef.current = setTimeout(() => {
+        setStatus("idle");
+        feedbackTimerRef.current = null;
+      }, 4000);
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setStatus("idle");
+      Alert.alert(
+        translate("智能标签生成失败"),
+        error instanceof ApiRequestError && error.code === "ai_not_configured"
+          ? translate("请先在“AI 集成”中配置默认模型。")
+          : error instanceof Error
+            ? error.message
+            : translate("AI 标签建议生成失败。")
+      );
+    } finally {
+      if (controllerRef.current === controller) controllerRef.current = null;
+    }
+  };
+
+  const accessibilityLabel = status === "loading"
+    ? translate("正在生成智能标签")
+    : status === "success"
+      ? translate("智能标签已添加")
+      : translate("智能标签");
+
+  return (
+    <Pressable
+      accessibilityLabel={accessibilityLabel}
+      accessibilityRole="button"
+      accessibilityState={{ disabled: unavailable || status === "loading" }}
+      disabled={unavailable || status === "loading"}
+      onPress={() => void generateAndApplyTags()}
+      style={[styles.smartTagButton, status === "success" && styles.smartTagButtonSuccess, unavailable && styles.buttonDisabled]}
+    >
+      {status === "loading"
+        ? <ActivityIndicator color="#047857" size="small" />
+        : status === "success"
+          ? <Check color="#047857" size={17} />
+          : <TagPlus color="#047857" size={18} />}
+    </Pressable>
+  );
+};
+
+const TagPickerModal = ({
+  dataScope,
+  onChange,
+  onClose,
+  selectedTags,
+  visible,
+}: {
+  dataScope: string;
+  onChange: (tags: string[]) => void;
+  onClose: () => void;
+  selectedTags: string[];
+  visible: boolean;
+}) => {
+  const { translate } = useMobileLocale();
+  const safeAreaInsets = useSafeAreaInsets();
+  const [searchText, setSearchText] = useState("");
+  const tagsQuery = useQuery({
+    queryKey: ["mobile-tags", dataScope],
+    queryFn: () => listLocalTags(dataScope),
+    enabled: visible && Boolean(dataScope),
+  });
+  const normalizedSearch = searchText.trim().replace(/^#/, "");
+  const tags = tagsQuery.data?.tags ?? [];
+  const visibleTags = tags.filter((tag) => tag.name.toLocaleLowerCase().includes(normalizedSearch.toLocaleLowerCase()));
+  const exactMatch = tags.some((tag) => tag.name.toLocaleLowerCase() === normalizedSearch.toLocaleLowerCase());
+
+  useEffect(() => {
+    if (visible) {
+      setSearchText("");
+    }
+  }, [visible]);
+
+  const commit = (nextTags: string[]) => onChange(Array.from(new Set(nextTags)).slice(0, 24));
+  const toggleTag = (name: string) => commit(
+    selectedTags.includes(name) ? selectedTags.filter((tag) => tag !== name) : [...selectedTags, name]
+  );
+  const createTag = () => {
+    const additions = parseTags(normalizedSearch);
+    if (additions.length === 0) return;
+    commit([...selectedTags, ...additions]);
+    setSearchText("");
+  };
+
+  return (
+    <Modal animationType="fade" onRequestClose={onClose} transparent visible={visible}>
+      <Pressable onPress={onClose} style={styles.actionSheetBackdrop}>
+        <Pressable style={[styles.actionSheet, styles.notebookPickerSheet, { paddingBottom: Math.max(8, safeAreaInsets.bottom) }]}>
+          <View style={styles.actionSheetHandle} />
+          <View style={styles.notebookPickerHeader}>
+            <View style={styles.notebookPickerHeaderText}>
+              <Text style={styles.actionSheetTitle}>{translate("选择标签")}</Text>
+              <Text style={styles.panelLabel}>{translate("点选已有标签，或输入名称创建新标签")}</Text>
+            </View>
+            <Pressable accessibilityLabel="关闭" accessibilityRole="button" onPress={onClose} style={styles.notebookPickerCloseButton}>
+              <X color="#0f172a" size={20} />
+            </Pressable>
+          </View>
+
+          <ScrollView contentContainerStyle={styles.notebookPickerContent} keyboardShouldPersistTaps="handled" style={styles.notebookPickerScroll}>
+            {selectedTags.length > 0 ? (
+              <View accessibilityLabel="已选标签" style={styles.tagPickerSelectedList}>
+                {selectedTags.map((tag) => (
+                  <Pressable key={tag} accessibilityLabel={`移除标签 ${tag}`} accessibilityRole="button" onPress={() => toggleTag(tag)} style={styles.tagPickerChip}>
+                    <Text style={styles.tagPickerChipText}>#{tag}</Text>
+                    <X color="#047857" size={14} />
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
+
+            <View style={styles.notebookPickerSearchBox}>
+              <Search color="#64748b" size={18} />
+              <TextInput
+                accessibilityLabel="搜索或输入新标签"
+                autoCapitalize="none"
+                autoCorrect={false}
+                onChangeText={setSearchText}
+                onSubmitEditing={createTag}
+                placeholder="搜索或输入新标签"
+                placeholderTextColor="#94a3b8"
+                returnKeyType="done"
+                style={styles.notebookPickerSearchInput}
+                value={searchText}
+              />
+              {normalizedSearch && !exactMatch && selectedTags.length < 24 ? (
+                <Pressable accessibilityLabel={`新建标签 ${normalizedSearch}`} accessibilityRole="button" onPress={createTag}>
+                  <Text style={styles.tagPickerCreateText}>{translate("新建")}</Text>
+                </Pressable>
+              ) : null}
+            </View>
+
+            {tagsQuery.isLoading ? (
+              <ActivityIndicator color="#16a06e" style={styles.tagPickerLoading} />
+            ) : visibleTags.length === 0 ? (
+              <View style={styles.emptyInlinePanel}>
+                <Tag color="#94a3b8" size={28} />
+                <Text style={styles.mutedText}>{translate("没有匹配的现有标签，可直接新建")}</Text>
+              </View>
+            ) : visibleTags.map((tag) => {
+              const selected = selectedTags.includes(tag.name);
+              return (
+                <Pressable
+                  key={tag.name}
+                  accessibilityLabel={`标签 ${tag.name}`}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected }}
+                  onPress={() => toggleTag(tag.name)}
+                  style={[styles.notebookPickerRow, selected && styles.notebookPickerRowActive]}
+                >
+                  <View style={[styles.tagPickerCheckbox, selected && styles.tagPickerCheckboxSelected]}>
+                    {selected ? <Check color="#ffffff" size={14} /> : null}
+                  </View>
+                  <Text numberOfLines={1} style={styles.tagPickerRowText}>#{tag.name}</Text>
+                  <Text style={styles.panelLabel}>{translate(`${tag.memoCount} 条笔记`)}</Text>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+};
+
 const CreateMemoModal = ({
   baseUrl,
   client: clientProp,
@@ -1785,6 +2055,7 @@ const CreateMemoModal = ({
   const contentJsonRef = useRef<TiptapDoc>(markdownToDoc(""));
   const contentMarkdownRef = useRef("");
   const draftVersionRef = useRef(0);
+  const draftWriteBarrier = useMemo(createMobileDraftWriteBarrier, []);
   const flushResolverRef = useRef<(() => void) | null>(null);
   const materializedMemoRef = useRef<MemoDetail | null>(null);
   const [notebookId, setNotebookId] = useState(fallbackNotebookId);
@@ -1792,6 +2063,7 @@ const CreateMemoModal = ({
   const [tagsText, setTagsText] = useState("");
   const [contentMarkdown, setContentMarkdown] = useState("");
   const [notebookPickerOpen, setNotebookPickerOpen] = useState(false);
+  const [tagPickerOpen, setTagPickerOpen] = useState(false);
   const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
   const [draftLoaded, setDraftLoaded] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -1800,6 +2072,8 @@ const CreateMemoModal = ({
   const imageOperationRef = useRef(imageOperation);
   const sharedImagesHandledRef = useRef(false);
   const createPendingRef = useRef(false);
+  const submitStartedRef = useRef(false);
+  const [submitStarted, setSubmitStarted] = useState(false);
   const [resourceTarget, setResourceTarget] = useState<MobileResourceTarget | null>(null);
   const { pickUploadAsset, uploadSourcePicker } = useMobileEditorUploadAsset();
   const targetNotebookId = notebookId || fallbackNotebookId;
@@ -1858,12 +2132,12 @@ const CreateMemoModal = ({
   // Component is only mounted while create is open — init once on mount.
   useEffect(() => {
     let active = true;
+    setDraftLoaded(false);
     setEditorReady(false);
     setTemplatePickerOpen(false);
     userEditedSinceOpenRef.current = false;
     draftVersionRef.current = 0;
 
-    // Mount DomWebView immediately — do not wait on AsyncStorage before cold start.
     if (initialDraft) {
       const markdown = initialDraft.contentMarkdown;
       contentMarkdownRef.current = markdown;
@@ -1886,30 +2160,13 @@ const CreateMemoModal = ({
     setContentMarkdown("");
     setNotebookId(fallbackNotebookId);
     setDirty(false);
-    setDraftLoaded(true);
 
-    void readMobileNewMemoDraft(dataScope).then((draft) => {
-      if (!active || !draft) {
-        return;
+    // A regular create session must always start blank. Remove any legacy
+    // auto-saved create draft instead of restoring content from the last one.
+    void clearMobileNewMemoDraft(dataScope).catch(() => undefined).finally(() => {
+      if (active) {
+        setDraftLoaded(true);
       }
-      // Don't clobber if the user already started typing.
-      if (userEditedSinceOpenRef.current) {
-        return;
-      }
-      const restoredNotebookId = notebooksRef.current.some((notebook) => notebook.id === draft.notebookId)
-        ? draft.notebookId
-        : fallbackNotebookId;
-      const markdown = draft.contentMarkdown ?? "";
-      const doc = markdownToDoc(markdown);
-      contentMarkdownRef.current = markdown;
-      contentJsonRef.current = doc;
-      setTitle(draft.title ?? "");
-      setTagsText(draft.tagsText ?? "");
-      setContentMarkdown(markdown);
-      setNotebookId(restoredNotebookId);
-      setDirty(false);
-      // setContent no longer steals focus — keep the title IME if the user is already typing.
-      pushBodyToEditor(doc);
     });
     return () => {
       active = false;
@@ -1920,6 +2177,27 @@ const CreateMemoModal = ({
   const isWebClipDraft = Boolean(
     initialDraft && "sourceUrl" in initialDraft && typeof initialDraft.sourceUrl === "string" && initialDraft.sourceUrl.length > 0
   );
+
+  const persistCurrentDraft = useCallback(() => {
+    const materializedMemo = materializedMemoRef.current;
+    const currentTitle = titleRef.current;
+    const currentContentMarkdown = contentMarkdownRef.current;
+    const currentNotebookId = targetNotebookIdRef.current;
+    const currentTagsText = tagsTextRef.current;
+    const updatedAt = new Date().toISOString();
+
+    return draftWriteBarrier.enqueue(() => materializedMemo
+      ? writeMobileMemoDraft({
+        memoId: materializedMemo.id,
+        expectedRevision: materializedMemo.revision,
+        title: currentTitle,
+        contentMarkdown: currentContentMarkdown,
+        notebookId: currentNotebookId,
+        tagsText: currentTagsText,
+        updatedAt,
+      })
+      : Promise.resolve());
+  }, [draftWriteBarrier]);
 
   const applyTemplateSeed = useCallback((seed: MobileCreateMemoSeed) => {
     const markdown = seed.contentMarkdown;
@@ -1959,32 +2237,14 @@ const CreateMemoModal = ({
     }
     const draftVersion = draftVersionRef.current;
     const timeout = setTimeout(() => {
-      const materializedMemo = materializedMemoRef.current;
-      const writeDraft = materializedMemo
-        ? writeMobileMemoDraft({
-          memoId: materializedMemo.id,
-          expectedRevision: materializedMemo.revision,
-          title,
-          contentMarkdown: contentMarkdownRef.current,
-          notebookId: targetNotebookId,
-          tagsText,
-          updatedAt: new Date().toISOString(),
-        })
-        : writeMobileNewMemoDraft(dataScope, {
-          title,
-          contentMarkdown: contentMarkdownRef.current,
-          notebookId: targetNotebookId,
-          tagsText,
-          updatedAt: new Date().toISOString(),
-        });
-      void writeDraft.then(() => {
-        if (draftVersionRef.current === draftVersion) {
+      void persistCurrentDraft().then((written) => {
+        if (written && !submitStartedRef.current && draftVersionRef.current === draftVersion) {
           setDirty(false);
         }
-      });
+      }).catch(() => undefined);
     }, 350);
     return () => clearTimeout(timeout);
-  }, [contentMarkdown, dataScope, dirty, draftLoaded, isWebClipDraft, tagsText, targetNotebookId, title]);
+  }, [contentMarkdown, dirty, draftLoaded, isWebClipDraft, persistCurrentDraft, tagsText, targetNotebookId, title]);
 
   const createMutation = useMutation({
     mutationFn: async () => {
@@ -2051,6 +2311,15 @@ const CreateMemoModal = ({
     },
     onSuccess: async (memo) => {
       const materializedMemoId = materializedMemoRef.current?.id ?? null;
+      // Wait for any already-running AsyncStorage write before removing the
+      // draft. Nothing queued after submit began is allowed to recreate it.
+      await draftWriteBarrier.blockAndDrain();
+      if (!isWebClipDraft) {
+        await clearMobileNewMemoDraft(dataScope);
+      }
+      if (materializedMemoId) {
+        await clearMobileMemoDraft(materializedMemoId);
+      }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["mobile", "notebooks"] }),
         queryClient.invalidateQueries({ queryKey: ["mobile", "memos"] }),
@@ -2063,19 +2332,23 @@ const CreateMemoModal = ({
       materializedMemoRef.current = null;
       draftVersionRef.current += 1;
       setDirty(false);
-      if (!isWebClipDraft) {
-        await clearMobileNewMemoDraft(dataScope);
-      }
-      if (materializedMemoId) {
-        await clearMobileMemoDraft(materializedMemoId);
-      }
       void onQueued();
       onCreated(memo);
     },
+    onError: () => {
+      submitStartedRef.current = false;
+      draftWriteBarrier.unblock();
+      setSubmitStarted(false);
+      draftVersionRef.current += 1;
+      setDirty(true);
+      if (!isWebClipDraft) {
+        void persistCurrentDraft().catch(() => undefined);
+      }
+    },
   });
   createPendingRef.current = createMutation.isPending;
-  const canSubmitCreateMemo = Boolean(targetNotebookId) && !createMutation.isPending && imageOperation === "idle";
-  const canUseTemplate = imageOperation === "idle" && !createMutation.isPending;
+  const canSubmitCreateMemo = Boolean(targetNotebookId) && !submitStarted && !createMutation.isPending && imageOperation === "idle";
+  const canUseTemplate = editorReady && imageOperation === "idle" && !submitStarted && !createMutation.isPending;
 
   const materializeMemoForImage = async () => {
     if (materializedMemoRef.current) {
@@ -2148,6 +2421,9 @@ const CreateMemoModal = ({
   }, [editorReady, initialSharedImages]);
 
   const markDirty = () => {
+    if (submitStartedRef.current) {
+      return;
+    }
     userEditedSinceOpenRef.current = true;
     draftVersionRef.current += 1;
     setDirty(true);
@@ -2155,14 +2431,25 @@ const CreateMemoModal = ({
 
   const flushEditor = () => flushMobileEditor(editorRef, flushResolverRef);
 
-  const requestClose = async () => {
-    if (createPendingRef.current || imageOperationRef.current !== "idle") {
+  const submitCreateMemo = async () => {
+    if (submitStartedRef.current || createPendingRef.current || imageOperationRef.current !== "idle") {
       return;
     }
-    await flushEditor();
-    // Match prior Android create behavior: back commits the note (even if empty draft).
-    createMutation.mutate();
+    submitStartedRef.current = true;
+    setSubmitStarted(true);
+    const draftsDrained = draftWriteBarrier.blockAndDrain();
+    try {
+      await flushEditor();
+      await draftsDrained;
+      createMutation.mutate();
+    } catch {
+      submitStartedRef.current = false;
+      draftWriteBarrier.unblock();
+      setSubmitStarted(false);
+    }
   };
+
+  const requestClose = () => submitCreateMemo();
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
@@ -2233,17 +2520,17 @@ const CreateMemoModal = ({
       locale={resolvedLocale}
       theme={resolvedTheme}
     />
-  ) : null, [aiPromptsJson, baseUrl, cancelSelectionAi, draftLoaded, loadEditorResource, requestSelectionAi, resolvedLocale, resolvedTheme, scheduleBodyKeyboard, selectResource]);
+  ) : null, [aiPromptsJson, baseUrl, cancelSelectionAi, draftLoaded, loadEditorResource, pushBodyToEditor, requestSelectionAi, resolvedLocale, resolvedTheme, scheduleBodyKeyboard, selectResource]);
 
   return (
     <SafeAreaView edges={["top", "left", "right", "bottom"]} style={styles.createMemoSafeArea}>
       <View style={styles.createMemoHeader}>
-        <Pressable accessibilityLabel="返回" accessibilityRole="button" disabled={createMutation.isPending || imageOperation !== "idle"} onPress={() => void requestClose()} style={styles.createMemoBackButton}>
-          <ChevronLeft color={createMutation.isPending || imageOperation !== "idle" ? "#cbd5e1" : "#0f172a"} size={30} />
+        <Pressable accessibilityLabel="返回" accessibilityRole="button" disabled={submitStarted || createMutation.isPending || imageOperation !== "idle"} onPress={() => void requestClose()} style={styles.createMemoBackButton}>
+          <ChevronLeft color={submitStarted || createMutation.isPending || imageOperation !== "idle" ? "#cbd5e1" : "#0f172a"} size={30} />
         </Pressable>
         <View style={styles.createMemoHeaderActions}>
-          <Text style={[styles.createMemoStatus, createMutation.isPending && styles.createMemoStatusActive]}>
-            {imageOperation === "creating" ? "正在创建" : imageOperation === "uploading" ? "正在上传" : createMutation.isPending || dirty ? "保存中" : editorReady ? "已保存" : "准备中"}
+          <Text style={[styles.createMemoStatus, (submitStarted || createMutation.isPending) && styles.createMemoStatusActive]}>
+            {imageOperation === "creating" ? "正在创建" : imageOperation === "uploading" ? "正在上传" : submitStarted || createMutation.isPending || dirty ? "保存中" : editorReady ? "已保存" : "准备中"}
           </Text>
           <Pressable
             accessibilityLabel={translate("模板")}
@@ -2257,10 +2544,10 @@ const CreateMemoModal = ({
           <Pressable
             accessibilityLabel="完成新建笔记"
             disabled={!canSubmitCreateMemo}
-            onPress={() => void flushEditor().then(() => createMutation.mutate())}
+            onPress={() => void submitCreateMemo()}
             style={[styles.createMemoDoneButton, !canSubmitCreateMemo && styles.createMemoDoneButtonDisabled]}
           >
-            {createMutation.isPending ? <ActivityIndicator color="#64748b" size="small" /> : <Text style={[styles.createMemoDoneText, !canSubmitCreateMemo && styles.createMemoDoneTextDisabled]}>完成</Text>}
+            {submitStarted || createMutation.isPending ? <ActivityIndicator color="#64748b" size="small" /> : <Text style={[styles.createMemoDoneText, !canSubmitCreateMemo && styles.createMemoDoneTextDisabled]}>完成</Text>}
           </Pressable>
         </View>
       </View>
@@ -2284,17 +2571,21 @@ const CreateMemoModal = ({
             <Text numberOfLines={1} style={styles.createMemoNotebookText}>{selectedNotebookName}</Text>
             <ChevronDown color="#64748b" size={14} />
           </Pressable>
-          <TextInput
-            accessibilityLabel="笔记标签"
-            autoCorrect
-            onChangeText={(value) => {
-              setTagsText(value);
+          <Pressable accessibilityLabel="选择笔记标签" accessibilityRole="button" onPress={() => setTagPickerOpen(true)} style={styles.createMemoTagsButton}>
+            <Text numberOfLines={1} style={[styles.createMemoTagsInput, !tagsText && styles.createMemoTagsPlaceholder]}>
+              {tagsText || "添加标签"}
+            </Text>
+            <ChevronDown color="#94a3b8" size={14} />
+          </Pressable>
+          <SmartTagButton
+            client={client}
+            contentMarkdown={contentMarkdown}
+            onChange={(nextTags) => {
+              setTagsText(nextTags.join(", "));
               markDirty();
             }}
-            placeholder="添加标签，用逗号分隔"
-            placeholderTextColor="#94a3b8"
-            style={styles.createMemoTagsInput}
-            value={tagsText}
+            selectedTags={parseTags(tagsText)}
+            title={title}
           />
         </View>
 
@@ -2316,6 +2607,16 @@ const CreateMemoModal = ({
           markDirty();
         }}
         visible={notebookPickerOpen}
+      />
+      <TagPickerModal
+        dataScope={dataScope}
+        onChange={(nextTags) => {
+          setTagsText(nextTags.join(", "));
+          markDirty();
+        }}
+        onClose={() => setTagPickerOpen(false)}
+        selectedTags={parseTags(tagsText)}
+        visible={tagPickerOpen}
       />
       <MobileResourceActions
         canMutate={Boolean(materializedMemoRef.current)}
@@ -2541,6 +2842,7 @@ const RichEditorModal = ({
   const [tagsText, setTagsText] = useState(restoredDraft?.tagsText ?? memo?.tags.join(", ") ?? "");
   const [notebookId, setNotebookId] = useState(restoredDraft?.notebookId ?? memo?.notebookId ?? "");
   const [notebookPickerOpen, setNotebookPickerOpen] = useState(false);
+  const [tagPickerOpen, setTagPickerOpen] = useState(false);
   const [draftRestored, setDraftRestored] = useState(Boolean(restoredDraft));
   const [ready, setReady] = useState(false);
   const [dirty, setDirty] = useState(Boolean(restoredDraft));
@@ -2810,6 +3112,11 @@ const RichEditorModal = ({
 
   return (
     <SafeAreaView style={styles.richEditorSafeArea}>
+      <KeyboardAvoidingView
+        behavior="height"
+        enabled={Platform.OS === "android"}
+        style={styles.richEditorKeyboardAvoiding}
+      >
         <View style={styles.createMemoHeader}>
           <Pressable accessibilityLabel="返回" accessibilityRole="button" disabled={saving || uploading} onPress={() => void requestClose()} style={styles.createMemoBackButton}>
             <ChevronLeft color={saving || uploading ? "#cbd5e1" : "#0f172a"} size={30} />
@@ -2846,17 +3153,23 @@ const RichEditorModal = ({
                 <Text numberOfLines={1} style={styles.createMemoNotebookText}>{notebookLabel}</Text>
                 <ChevronDown color="#64748b" size={14} />
               </Pressable>
-              <TextInput
-                autoCorrect
-                onChangeText={(value) => {
-                  setTagsText(value);
+              <Pressable accessibilityLabel="选择笔记标签" accessibilityRole="button" onPress={() => setTagPickerOpen(true)} style={[styles.createMemoTagsButton, styles.richStandaloneTagsInput]}>
+                <Text numberOfLines={1} style={[styles.createMemoTagsInput, !tagsText && styles.createMemoTagsPlaceholder]}>
+                  {tagsText || "添加标签"}
+                </Text>
+                <ChevronDown color="#94a3b8" size={14} />
+              </Pressable>
+              <SmartTagButton
+                client={client}
+                contentMarkdown={contentMarkdownRef.current}
+                disabled={saving || uploading}
+                onChange={(nextTags) => {
+                  setTagsText(nextTags.join(", "));
                   dirtyRef.current = true;
                   setDirty(true);
                 }}
-                placeholder="添加标签，用逗号分隔"
-                placeholderTextColor="#94a3b8"
-                style={[styles.createMemoTagsInput, styles.richStandaloneTagsInput]}
-                value={tagsText}
+                selectedTags={parseTags(tagsText)}
+                title={title}
               />
             </View>
             {draftRestored ? <Text style={styles.richEditorDraftNotice}>已恢复上次未完成的本地草稿</Text> : null}
@@ -2883,6 +3196,17 @@ const RichEditorModal = ({
           }}
           visible={notebookPickerOpen}
         />
+        <TagPickerModal
+          dataScope={createMobileDataScope(session?.baseUrl ?? baseUrl, session?.user?.id)}
+          onChange={(nextTags) => {
+            setTagsText(nextTags.join(", "));
+            dirtyRef.current = true;
+            setDirty(true);
+          }}
+          onClose={() => setTagPickerOpen(false)}
+          selectedTags={parseTags(tagsText)}
+          visible={tagPickerOpen}
+        />
         <MobileResourceActions
           canMutate={Boolean(memo && !memo.id.startsWith("local:"))}
           onClose={() => setResourceTarget(null)}
@@ -2893,6 +3217,7 @@ const RichEditorModal = ({
           target={resourceTarget}
         />
         {uploadSourcePicker}
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 };
