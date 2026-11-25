@@ -5,11 +5,6 @@ import {
 } from "@edgeever/client";
 import type { AuthSession } from "@edgeever/shared";
 import { normalizeInstanceUrl } from "@edgeever/shared/public-demo";
-import {
-  POSTER_RENDER_EVENTS_PATH,
-  POSTER_RENDER_EVENTS_PROTOCOL,
-  POSTER_RENDER_SESSION_PROTOCOL_PREFIX,
-} from "@edgeever/shared/poster-render-events";
 import { createClientUuid } from "./client-id";
 
 export { ApiRequestError };
@@ -369,16 +364,6 @@ const client = createEdgeEverClient({
   allowAiServerFallback: !desktopAiDirectEnabled,
   providerFetch: desktopAiDirectEnabled ? desktopProviderFetch : undefined,
 });
-
-export const openPosterRenderEvents = () => {
-  const url = new URL(`${getConfiguredDesktopApiBaseUrl()}${POSTER_RENDER_EVENTS_PATH}`, window.location.href);
-  if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("Poster render events require an HTTP instance URL.");
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  const protocols = [POSTER_RENDER_EVENTS_PROTOCOL];
-  const token = getDesktopSessionToken();
-  if (token) protocols.push(`${POSTER_RENDER_SESSION_PROTOCOL_PREFIX}${token}`);
-  return new WebSocket(url, protocols);
-};
 
 export const api = {
   ...client,

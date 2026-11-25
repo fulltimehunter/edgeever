@@ -19,18 +19,7 @@ export const posterRenderJob = (row: PosterRenderJobRow) => ({
 export const readPosterRenderJob = (db: DatabaseAdapter, workspace: string, id: string) =>
   db.prepare('SELECT * FROM poster_render_jobs WHERE workspace_id = ? AND id = ?').bind(workspace, id).first<PosterRenderJobRow>();
 
-export type PosterRenderRequest = {
-  workspace: string;
-  memoId: string;
-  revision: number;
-  templateId?: string;
-};
-
-export async function requestPosterRender(
-  db: DatabaseAdapter,
-  { workspace, memoId, revision, templateId }: PosterRenderRequest,
-  notifyPending?: () => void,
-) {
+export async function requestPosterRender(db: DatabaseAdapter, workspace: string, memoId: string, revision: number, templateId?: string) {
   if (!Number.isInteger(revision) || revision < 0) throw new AppError('invalid_params', 'expectedRevision is required', 400);
   if (templateId && !POSTER_DESIGN_TEMPLATES.some(template => template.available && template.id === templateId)) throw new AppError('invalid_params', 'Unknown design template; read get_poster_capabilities', 400);
   const memo = await getMemoDetail(db, workspace, memoId);
@@ -44,9 +33,7 @@ export async function requestPosterRender(
   await db.prepare("DELETE FROM poster_render_jobs WHERE workspace_id = ? AND status IN ('completed','failed') AND created_at < ?").bind(workspace, new Date(Date.now() - 7 * 86400000).toISOString()).run();
   const output = (row: PosterRenderJobRow) => {
     if (row.expected_revision !== revision || row.template_id !== (templateId ?? null)) throw new AppError('render_busy', 'Another render is pending for this poster', 409);
-    const job = posterRenderJob(row);
-    if (job.status === 'pending') notifyPending?.();
-    return { ...job, message: 'Client render task: pending waits for an online desktop/Web workspace; rendering is in progress. Poll get_poster_render_job; only completed means rendered. Then read get_poster_preview.' };
+    return { ...posterRenderJob(row), message: 'Client render task: pending waits for an online desktop/Web workspace; rendering is in progress. Poll get_poster_render_job; only completed means rendered. Then read get_poster_preview.' };
   };
   const existing = await db.prepare("SELECT * FROM poster_render_jobs WHERE workspace_id = ? AND memo_id = ? AND status IN ('pending','rendering')").bind(workspace, memoId).first<PosterRenderJobRow>();
   if (existing) return output(existing);
@@ -59,10 +46,6 @@ export async function requestPosterRender(
   if (!row) throw new AppError('render_queue_full', 'Too many pending renders', 429);
   return output(row);
 }
-
-export const hasPendingPosterRender = async (db: DatabaseAdapter, workspace: string) =>
-  Boolean(await db.prepare("SELECT 1 FROM poster_render_jobs WHERE workspace_id = ? AND status = 'pending' AND expires_at > ? LIMIT 1")
-    .bind(workspace, isoNow()).first());
 
 export async function claimPosterRender(db: DatabaseAdapter, workspace: string) {
   const token = createId('claim');

@@ -346,7 +346,7 @@ const authenticateBearerToken = async (c: AppContext, touch: boolean): Promise<A
   };
 };
 
-export const authenticateSessionToken = async (c: AppContext, token: string, touch: boolean): Promise<AuthContext | null> => {
+const authenticateSessionToken = async (c: AppContext, token: string, touch: boolean): Promise<AuthContext | null> => {
   const now = isoNow();
   const hashes = await sessionTokenHashes(token);
   const row = await c.env.storage.db.prepare(

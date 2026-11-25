@@ -1,6 +1,5 @@
 import { parsePosterDocument, type PosterDocument } from '@edgeever/shared';
-import { api, ApiRequestError, openPosterRenderEvents } from './api';
-import { subscribeToPosterRenders } from './poster-render-subscription';
+import { api, ApiRequestError } from './api';
 
 export async function applyClientPosterTemplate(document: PosterDocument, templateId: string, zh: boolean) {
   const { applyPosterDesign } = await import('./poster-design/templates');
@@ -12,9 +11,10 @@ export async function applyClientPosterTemplate(document: PosterDocument, templa
 type RenderClient = Pick<typeof api, 'claimPosterRender' | 'completePosterRender' | 'getMemo' | 'getResourceBlob' | 'uploadMemoResource' | 'deleteResource'>;
 export function startPosterClientRenderer(onSaved: () => Promise<void>, zh: boolean, client: RenderClient = api) {
   let stopped = false;
-
-  const drain = async () => {
-    while (!stopped && navigator.onLine !== false) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const tick = async () => {
+    try {
+      if (navigator.onLine === false || stopped) return;
       const { job } = await client.claimPosterRender();
       if (!job) return;
       let previewId: string | undefined;
@@ -43,11 +43,12 @@ export function startPosterClientRenderer(onSaved: () => Promise<void>, zh: bool
         }
         await client.completePosterRender(job.id, { claimToken: job.claimToken, errorCode: error instanceof ApiRequestError && error.status === 409 ? 'revision_conflict' : 'render_failed' }).catch(() => undefined);
       }
+    } catch {
+      // Offline/login transitions are retried without presenting a false result.
+    } finally {
+      if (!stopped) timer = setTimeout(() => { void tick(); }, 15000);
     }
   };
-  const unsubscribe = subscribeToPosterRenders(openPosterRenderEvents, drain);
-  return () => {
-    stopped = true;
-    unsubscribe();
-  };
+  void tick();
+  return () => { stopped = true; if (timer) clearTimeout(timer); };
 }
